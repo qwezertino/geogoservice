@@ -5,6 +5,10 @@
 # Go module cache
 vendor/
 
+# Local persistent data (postgres, minio) - ignore contents but keep directory structure
+data/**
+!data/**/.gitkeep
+
 # Environment secrets (never commit real credentials)
 .env
 
