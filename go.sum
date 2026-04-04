@@ -1,0 +1,2 @@
+# This file is intentionally empty.
+# Run `go mod tidy` (or `docker compose build`) to populate it.

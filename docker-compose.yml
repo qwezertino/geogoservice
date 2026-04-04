@@ -1,0 +1,101 @@
+version: "3.9"
+
+# ─── Shared environment for all Go replicas ───────────────────────────────────
+x-app-env: &app-env
+  DB_HOST: postgis
+  DB_PORT: "5432"
+  DB_USER: geouser
+  DB_PASSWORD: geopassword
+  DB_NAME: geodb
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: minioadmin
+  MINIO_SECRET_KEY: minioadmin
+  MINIO_BUCKET: ndvi-tiles
+  MINIO_USE_SSL: "false"
+  # GDAL env vars – allow /vsicurl/ to use the network
+  GDAL_HTTP_UNSAFESSL: "YES"
+  CPL_VSIL_CURL_ALLOWED_EXTENSIONS: ".tif,.tiff"
+  GDAL_DISABLE_READDIR_ON_OPEN: "EMPTY_DIR"
+  PORT: "8080"
+
+services:
+  # ── PostGIS ─────────────────────────────────────────────────────────────────
+  postgis:
+    image: postgis/postgis:15-3.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: geouser
+      POSTGRES_PASSWORD: geopassword
+      POSTGRES_DB: geodb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geouser -d geodb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO ───────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO bucket initializer (runs once) ────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/ndvi-tiles &&
+        mc anonymous set download local/ndvi-tiles
+      "
+    restart: "no"
+
+  # ── Go service (scale with: docker compose up -d --scale ndvi-app=N) ────────
+  ndvi-app:
+    build: .
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    depends_on:
+      postgis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    expose:
+      - "8080"
+
+  # ── Nginx load balancer ─────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ndvi-app
+
+volumes:
+  postgis_data:
+  minio_data:

@@ -1,0 +1,162 @@
+// Package stac provides a minimal client for querying a STAC API
+// (Microsoft Planetary Computer / AWS Earth Search).
+package stac
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/qwezert/geogoservice/internal/geo"
+)
+
+const (
+	// PlanetaryComputerSTAC is the base URL for the Microsoft Planetary Computer STAC API.
+	PlanetaryComputerSTAC = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+	// Sentinel2Collection is the Sentinel-2 Level-2A collection identifier.
+	Sentinel2Collection = "sentinel-2-l2a"
+
+	maxCloudCover = 10.0
+)
+
+// BandURLs holds the HTTPS/S3 URLs for the Red (B04) and NIR (B08) bands.
+type BandURLs struct {
+	RedURL string
+	NIRURL string
+}
+
+// Client is a minimal STAC API client.
+type Client struct {
+	http    *http.Client
+	baseURL string
+}
+
+// NewClient creates a new STAC Client targeting baseURL (defaults to Planetary Computer).
+func NewClient(baseURL string) *Client {
+	if baseURL == "" {
+		baseURL = PlanetaryComputerSTAC
+	}
+	return &Client{
+		http: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: &http.Transport{MaxIdleConnsPerHost: 10},
+		},
+		baseURL: baseURL,
+	}
+}
+
+// stacSearchRequest is the JSON body sent to the STAC /search endpoint.
+type stacSearchRequest struct {
+	Collections []string               `json:"collections"`
+	Datetime    string                 `json:"datetime"`
+	BBox        [4]float64             `json:"bbox"`
+	Query       map[string]interface{} `json:"query"`
+	Limit       int                    `json:"limit"`
+}
+
+// stacSearchResponse is a partial deserialisation of the GeoJSON FeatureCollection
+// returned by the STAC /search endpoint.
+type stacSearchResponse struct {
+	Features []stacFeature `json:"features"`
+}
+
+type stacFeature struct {
+	Assets stacAssets `json:"assets"`
+}
+
+type stacAssets struct {
+	B04 *stacAsset `json:"B04"`
+	B08 *stacAsset `json:"B08"`
+}
+
+type stacAsset struct {
+	Href string `json:"href"`
+}
+
+// FindBestScene queries the STAC API for the least-cloudy Sentinel-2 scene that
+// intersects bbox (EPSG:4326) on date (YYYY-MM-DD). It returns the COG URLs for
+// the Red and NIR bands of the best matching scene.
+func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) (*BandURLs, error) {
+	// Build a full-day datetime interval
+	datetime := fmt.Sprintf("%sT00:00:00Z/%sT23:59:59Z", date, date)
+
+	body := stacSearchRequest{
+		Collections: []string{Sentinel2Collection},
+		Datetime:    datetime,
+		BBox:        [4]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY},
+		Query: map[string]interface{}{
+			"eo:cloud_cover": map[string]interface{}{
+				"lt": maxCloudCover,
+			},
+		},
+		Limit: 5,
+	}
+
+	reqBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal STAC request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/search", io.NopCloser(bytesReader(reqBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("build STAC HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(reqBytes))
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("STAC HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("STAC API returned HTTP %d", resp.StatusCode)
+	}
+
+	var result stacSearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode STAC response: %w", err)
+	}
+
+	if len(result.Features) == 0 {
+		return nil, fmt.Errorf("no Sentinel-2 scenes found for bbox=%v date=%s (cloud<%.0f%%)",
+			bbox, date, maxCloudCover)
+	}
+
+	// Pick the first feature (STAC returns them ordered by cloud cover ascending
+	// when using the eo:cloud_cover query filter on Planetary Computer).
+	best := result.Features[0]
+	if best.Assets.B04 == nil || best.Assets.B08 == nil {
+		return nil, fmt.Errorf("selected STAC scene is missing B04 or B08 asset URLs")
+	}
+
+	return &BandURLs{
+		RedURL: best.Assets.B04.Href,
+		NIRURL: best.Assets.B08.Href,
+	}, nil
+}
+
+// bytesReader is a helper to turn []byte into an io.Reader without importing bytes.
+func bytesReader(b []byte) io.Reader {
+	return &byteSliceReader{data: b}
+}
+
+type byteSliceReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *byteSliceReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}

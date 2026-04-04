@@ -1,0 +1,26 @@
+# Compiled binary
+/geogoservice
+/cmd/server/server
+
+# Go module cache
+vendor/
+
+# Environment secrets (never commit real credentials)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker build cache
+*.tar
+
+# Test coverage
+*.out
+coverage.html
