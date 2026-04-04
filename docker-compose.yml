@@ -1,20 +1,20 @@
 # ─── Shared environment for all Go replicas ───────────────────────────────────
 x-app-env: &app-env
   DB_HOST: postgis
-  DB_PORT: "5432"
-  DB_USER: geouser
-  DB_PASSWORD: geopassword
-  DB_NAME: geodb
-  MINIO_ENDPOINT: minio:9000
-  MINIO_ACCESS_KEY: minioadmin
-  MINIO_SECRET_KEY: minioadmin
-  MINIO_BUCKET: ndvi-tiles
+  DB_PORT: "5432"               # internal container port – never changes
+  DB_USER: ${DB_USER}
+  DB_PASSWORD: ${DB_PASSWORD}
+  DB_NAME: ${DB_NAME}
+  MINIO_ENDPOINT: minio:9000    # internal container address – never changes
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+  MINIO_BUCKET: ${MINIO_BUCKET}
   MINIO_USE_SSL: "false"
   # GDAL env vars – allow /vsicurl/ to use the network
   GDAL_HTTP_UNSAFESSL: "YES"
   CPL_VSIL_CURL_ALLOWED_EXTENSIONS: ".tif,.tiff"
   GDAL_DISABLE_READDIR_ON_OPEN: "EMPTY_DIR"
-  PORT: "8080"
+  PORT: "8080"                  # internal container port – never changes
 
 services:
   # ── PostGIS ─────────────────────────────────────────────────────────────────
@@ -22,11 +22,11 @@ services:
     image: postgis/postgis:15-3.4-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: geouser
-      POSTGRES_PASSWORD: geopassword
-      POSTGRES_DB: geodb
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
     ports:
-      - "5432:5432"
+      - "${HOST_PORT_DB:-5432}:5432"  # change HOST_PORT_DB in .env to remap
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
@@ -42,11 +42,11 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${HOST_PORT_MINIO:-9000}:9000"          # S3 API
+      - "${HOST_PORT_MINIO_CONSOLE:-9001}:9001"  # Web UI
     volumes:
       - ./data/minio:/data
     healthcheck:
@@ -88,7 +88,7 @@ services:
     image: nginx:1.25-alpine
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "${HOST_PORT_HTTP:-80}:80"  # change HOST_PORT_HTTP in .env to remap
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
