@@ -74,14 +74,16 @@ Generates an NDVI PNG tile for the given bounding box and date.
 
 #### Parameters
 
-| Parameter | Required | Description | Example |
-|-----------|----------|-------------|---------|
-| `bbox`    | ✅ | Bounding box as `minX,minY,maxX,maxY` in **EPSG:3857** (Web Mercator, metres) | `1486000,6890000,1500000,6900000` |
-| `date`    | ✅ | Acquisition date in `YYYY-MM-DD` format | `2024-06-15` |
-| `w`       | ✅ | Output image width in pixels (1–2048) | `256` |
-| `h`       | ✅ | Output image height in pixels (1–2048) | `256` |
-| `srs`     | ❌ | Coordinate reference system (only `EPSG:3857` supported) | `EPSG:3857` |
-| `index`   | ❌ | Spectral index type (only `ndvi` supported) | `ndvi` |
+Both the modern and the legacy GeoServer format are accepted simultaneously.
+
+| Parameter | Modern | Legacy (GeoServer) | Description |
+|-----------|--------|--------------------|-------------|
+| bbox | `bbox=minX,minY,maxX,maxY` | `box[0]=minX&box[1]=minY&box[2]=maxX&box[3]=maxY` | Bounding box in **EPSG:3857** (metres) |
+| date | `date=YYYY-MM-DD` | `date=<unix timestamp>` | Acquisition date |
+| width | `w=256` | `width=256` | Output image width in pixels (1–2048) |
+| height | `h=256` | `height=256` | Output image height in pixels (1–2048) |
+| index | `index=ndvi` | `indexName=ndvi` | Spectral index (only `ndvi` supported) |
+| srs | `srs=EPSG:3857` | — | CRS (optional, only EPSG:3857 accepted) |
 
 #### Response
 
@@ -94,17 +96,26 @@ Generates an NDVI PNG tile for the given bounding box and date.
 
 ## Example requests
 
-### Berlin area, 256×256 tile
+### Modern format — Berlin area, 256×256 tile
 
 ```bash
-curl "http://localhost/api/render?bbox=1486000,6890000,1500000,6900000&srs=EPSG:3857&date=2024-06-15&w=256&h=256&index=ndvi" \
+curl "http://localhost/api/render?bbox=1486000,6890000,1500000,6900000&date=2024-06-15&w=256&h=256" \
   --output berlin_ndvi.png
 ```
+
+### Legacy GeoServer format (drop-in replacement)
+
+```bash
+curl "http://localhost/api/render?box[0]=1486000&box[1]=6890000&box[2]=1500000&box[3]=6900000&date=1718409600&width=256&height=256&indexName=ndvi" \
+  --output berlin_ndvi.png
+```
+
+> `date=1718409600` is Unix timestamp for `2024-06-15`.
 
 ### Paris area, 512×512 tile
 
 ```bash
-curl "http://localhost/api/render?bbox=261000,6241000,272000,6251000&srs=EPSG:3857&date=2024-07-01&w=512&h=512" \
+curl "http://localhost/api/render?bbox=261000,6241000,272000,6251000&date=2024-07-01&w=512&h=512" \
   --output paris_ndvi.png
 ```
 

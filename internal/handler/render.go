@@ -15,6 +15,17 @@ import (
 	"github.com/qwezert/geogoservice/internal/stac"
 )
 
+// Both parameter formats are supported:
+//
+// Modern format (our API):
+//
+//	bbox=minX,minY,maxX,maxY  date=YYYY-MM-DD  w=256  h=256  index=ndvi
+//
+// Legacy GeoServer format:
+//
+//	box[0]=minX  box[1]=minY  box[2]=maxX  box[3]=maxY
+//	date=<unix-timestamp>  width=256  height=256  indexName=ndvi
+
 // RenderHandler holds the shared service dependencies.
 type RenderHandler struct {
 	store      *cache.Store
@@ -28,14 +39,7 @@ func New(store *cache.Store, stacClient *stac.Client) *RenderHandler {
 
 // ServeHTTP handles GET /api/render requests.
 //
-// Required query parameters:
-//
-//	bbox  – comma-separated minX,minY,maxX,maxY in EPSG:3857
-//	srs   – must be "EPSG:3857"
-//	date  – YYYY-MM-DD
-//	w     – output width  in pixels (1–2048)
-//	h     – output height in pixels (1–2048)
-//	index – spectral index type ("ndvi")
+// Supports two parameter formats – see package-level comment for details.
 func (rh *RenderHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -138,62 +142,48 @@ type renderParams struct {
 	w, h     int
 }
 
+// parseParams accepts both the modern and legacy GeoServer parameter formats.
 func parseParams(r *http.Request) (*renderParams, error) {
 	q := r.URL.Query()
 
-	// bbox
-	bboxStr := q.Get("bbox")
-	if bboxStr == "" {
-		return nil, errors.New("missing required parameter: bbox")
-	}
-	parts := strings.Split(bboxStr, ",")
-	if len(parts) != 4 {
-		return nil, errors.New("bbox must have exactly 4 comma-separated values")
-	}
-	coords := make([]float64, 4)
-	for i, p := range parts {
-		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid bbox value %q: %w", p, err)
-		}
-		coords[i] = v
-	}
-	bbox := geo.BBox{MinX: coords[0], MinY: coords[1], MaxX: coords[2], MaxY: coords[3]}
-	if bbox.MinX >= bbox.MaxX || bbox.MinY >= bbox.MaxY {
-		return nil, errors.New("bbox is degenerate (minX>=maxX or minY>=maxY)")
+	// ── bbox ─────────────────────────────────────────────────────────────────
+	// Modern:  bbox=minX,minY,maxX,maxY
+	// Legacy:  box[0]=minX  box[1]=minY  box[2]=maxX  box[3]=maxY
+	bbox, err := parseBBox(q)
+	if err != nil {
+		return nil, err
 	}
 
-	// srs
+	// ── srs ──────────────────────────────────────────────────────────────────
 	srs := q.Get("srs")
 	if srs != "" && srs != "EPSG:3857" {
 		return nil, fmt.Errorf("unsupported srs %q; only EPSG:3857 is accepted", srs)
 	}
 
-	// date
-	dateStr := q.Get("date")
-	if dateStr == "" {
-		return nil, errors.New("missing required parameter: date")
-	}
-	if _, err := time.Parse("2006-01-02", dateStr); err != nil {
-		return nil, fmt.Errorf("date must be YYYY-MM-DD: %w", err)
-	}
-
-	// w / h
-	wStr, hStr := q.Get("w"), q.Get("h")
-	if wStr == "" || hStr == "" {
-		return nil, errors.New("missing required parameters: w and h")
-	}
-	width, err := strconv.Atoi(wStr)
-	if err != nil || width < 1 || width > 2048 {
-		return nil, errors.New("w must be an integer in [1, 2048]")
-	}
-	height, err := strconv.Atoi(hStr)
-	if err != nil || height < 1 || height > 2048 {
-		return nil, errors.New("h must be an integer in [1, 2048]")
+	// ── date ─────────────────────────────────────────────────────────────────
+	// Modern:  date=YYYY-MM-DD
+	// Legacy:  date=<unix timestamp in seconds>
+	dateStr, err := parseDate(q.Get("date"))
+	if err != nil {
+		return nil, err
 	}
 
-	// index
-	indexType := q.Get("index")
+	// ── width / height ───────────────────────────────────────────────────────
+	// Modern:  w=256  h=256
+	// Legacy:  width=256  height=256
+	width, err := parseDimension(firstNonEmpty(q.Get("w"), q.Get("width")), "width")
+	if err != nil {
+		return nil, err
+	}
+	height, err := parseDimension(firstNonEmpty(q.Get("h"), q.Get("height")), "height")
+	if err != nil {
+		return nil, err
+	}
+
+	// ── index ────────────────────────────────────────────────────────────────
+	// Modern:  index=ndvi
+	// Legacy:  indexName=ndvi
+	indexType := strings.ToLower(firstNonEmpty(q.Get("index"), q.Get("indexName")))
 	if indexType == "" {
 		indexType = "ndvi"
 	}
@@ -208,4 +198,89 @@ func parseParams(r *http.Request) (*renderParams, error) {
 		w:        width,
 		h:        height,
 	}, nil
+}
+
+// parseBBox parses bbox from either format:
+//   - modern:  bbox=minX,minY,maxX,maxY
+//   - legacy:  box[0]=minX  box[1]=minY  box[2]=maxX  box[3]=maxY
+func parseBBox(q interface{ Get(string) string }) (geo.BBox, error) {
+	var coords [4]float64
+
+	if bboxStr := q.Get("bbox"); bboxStr != "" {
+		// Modern format
+		parts := strings.Split(bboxStr, ",")
+		if len(parts) != 4 {
+			return geo.BBox{}, errors.New("bbox must have exactly 4 comma-separated values")
+		}
+		for i, p := range parts {
+			v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+			if err != nil {
+				return geo.BBox{}, fmt.Errorf("invalid bbox value %q: %w", p, err)
+			}
+			coords[i] = v
+		}
+	} else if v := q.Get("box[0]"); v != "" {
+		// Legacy GeoServer format
+		keys := [4]string{"box[0]", "box[1]", "box[2]", "box[3]"}
+		for i, key := range keys {
+			val := q.Get(key)
+			if val == "" {
+				return geo.BBox{}, fmt.Errorf("missing legacy bbox parameter: %s", key)
+			}
+			f, err := strconv.ParseFloat(val, 64)
+			if err != nil {
+				return geo.BBox{}, fmt.Errorf("invalid %s value %q: %w", key, val, err)
+			}
+			coords[i] = f
+		}
+	} else {
+		return geo.BBox{}, errors.New("missing bbox: provide either bbox=X1,Y1,X2,Y2 or box[0..3]=...")
+	}
+
+	bbox := geo.BBox{MinX: coords[0], MinY: coords[1], MaxX: coords[2], MaxY: coords[3]}
+	if bbox.MinX >= bbox.MaxX || bbox.MinY >= bbox.MaxY {
+		return geo.BBox{}, errors.New("bbox is degenerate (minX>=maxX or minY>=maxY)")
+	}
+	return bbox, nil
+}
+
+// parseDate accepts either YYYY-MM-DD or a Unix timestamp (seconds).
+func parseDate(raw string) (string, error) {
+	if raw == "" {
+		return "", errors.New("missing required parameter: date")
+	}
+
+	// Try YYYY-MM-DD first
+	if _, err := time.Parse("2006-01-02", raw); err == nil {
+		return raw, nil
+	}
+
+	// Try Unix timestamp (legacy format)
+	ts, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("date must be YYYY-MM-DD or a Unix timestamp, got %q", raw)
+	}
+	return time.Unix(ts, 0).UTC().Format("2006-01-02"), nil
+}
+
+// parseDimension parses and validates a pixel dimension value.
+func parseDimension(raw, name string) (int, error) {
+	if raw == "" {
+		return 0, fmt.Errorf("missing required parameter: %s (or its alias)", name)
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 1 || v > 2048 {
+		return 0, fmt.Errorf("%s must be an integer in [1, 2048]", name)
+	}
+	return v, nil
+}
+
+// firstNonEmpty returns the first non-empty string from the arguments.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
