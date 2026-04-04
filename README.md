@@ -1,0 +1,185 @@
+# geogoservice
+
+Stateless Go microservice that generates NDVI PNG tiles on-the-fly from Sentinel-2 satellite imagery.
+
+## Architecture
+
+```
+Client
+  │
+  ▼
+Nginx :80  (load balancer, rate limiter)
+  │
+  ├──▶ ndvi-app replica 1 :8080
+  ├──▶ ndvi-app replica 2 :8080
+  └──▶ ndvi-app replica 3 :8080
+            │
+            ├── PostGIS  (tile cache index)
+            ├── MinIO    (PNG cache storage)
+            └── Planetary Computer STAC API  (satellite imagery)
+```
+
+**Request pipeline:**
+1. Transform bbox EPSG:3857 → EPSG:4326
+2. Check PostGIS cache → if hit, return PNG from MinIO immediately
+3. Query STAC API for least-cloudy Sentinel-2 scene
+4. Read only required pixels from COG via GDAL `/vsicurl/` (HTTP Range requests)
+5. Compute NDVI = (NIR − Red) / (NIR + Red)
+6. Apply colour map → encode PNG
+7. Async upload to MinIO + insert index record in PostGIS
+8. Return PNG to client
+
+---
+
+## Quick start
+
+### 1. Prerequisites
+
+- Docker + Docker Compose v2
+- A `.env` file (copy from `.env.example`)
+
+```bash
+cp .env.example .env
+# Edit .env – change passwords and host ports if needed
+```
+
+### 2. Start the stack
+
+```bash
+docker compose up -d --scale ndvi-app=3
+```
+
+Wait ~15 seconds for PostGIS and MinIO to become healthy, then verify:
+
+```bash
+docker compose ps
+```
+
+All services should show `healthy` or `running`.
+
+### 3. Health check
+
+```bash
+curl http://localhost/health
+# → ok
+```
+
+---
+
+## API
+
+### `GET /api/render`
+
+Generates an NDVI PNG tile for the given bounding box and date.
+
+#### Parameters
+
+| Parameter | Required | Description | Example |
+|-----------|----------|-------------|---------|
+| `bbox`    | ✅ | Bounding box as `minX,minY,maxX,maxY` in **EPSG:3857** (Web Mercator, metres) | `1486000,6890000,1500000,6900000` |
+| `date`    | ✅ | Acquisition date in `YYYY-MM-DD` format | `2024-06-15` |
+| `w`       | ✅ | Output image width in pixels (1–2048) | `256` |
+| `h`       | ✅ | Output image height in pixels (1–2048) | `256` |
+| `srs`     | ❌ | Coordinate reference system (only `EPSG:3857` supported) | `EPSG:3857` |
+| `index`   | ❌ | Spectral index type (only `ndvi` supported) | `ndvi` |
+
+#### Response
+
+- `200 OK` — PNG image (`image/png`)
+- `400 Bad Request` — invalid or missing parameters
+- `404 Not Found` — no Sentinel-2 scene found for the given bbox/date (cloud cover < 10%)
+- `500 Internal Server Error` — GDAL or processing error
+
+---
+
+## Example requests
+
+### Berlin area, 256×256 tile
+
+```bash
+curl "http://localhost/api/render?bbox=1486000,6890000,1500000,6900000&srs=EPSG:3857&date=2024-06-15&w=256&h=256&index=ndvi" \
+  --output berlin_ndvi.png
+```
+
+### Paris area, 512×512 tile
+
+```bash
+curl "http://localhost/api/render?bbox=261000,6241000,272000,6251000&srs=EPSG:3857&date=2024-07-01&w=512&h=512" \
+  --output paris_ndvi.png
+```
+
+### How to find a bbox in EPSG:3857
+
+The easiest way is [bboxfinder.com](http://bboxfinder.com) — draw your area, switch projection to `EPSG:3857`, copy the coordinates.
+
+---
+
+## Colour map
+
+| NDVI value | Colour | Meaning |
+|-----------|--------|---------|
+| −1.0 … 0.05 | Transparent | Water, clouds, bare rock |
+| 0.05 … 0.2  | Red → Yellow | Sparse / stressed vegetation |
+| 0.2 … 1.0   | Light green → Dark green | Healthy vegetation |
+
+---
+
+## Scaling
+
+Change the number of app replicas at any time without downtime:
+
+```bash
+# Scale up to 5 replicas
+docker compose up -d --scale ndvi-app=5
+
+# Or use the Makefile shortcut
+make scale n=5
+```
+
+Nginx automatically discovers new replicas via Docker DNS (re-resolves every 5 s).
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_USER` | `geouser` | PostgreSQL username |
+| `DB_PASSWORD` | — | PostgreSQL password |
+| `DB_NAME` | `geodb` | PostgreSQL database name |
+| `MINIO_ACCESS_KEY` | `minioadmin` | MinIO access key |
+| `MINIO_SECRET_KEY` | — | MinIO secret key |
+| `MINIO_BUCKET` | `ndvi-tiles` | Bucket for cached PNG tiles |
+| `HOST_PORT_HTTP` | `80` | Host port for Nginx (public entry point) |
+| `HOST_PORT_DB` | `5432` | Host port for PostgreSQL |
+| `HOST_PORT_MINIO` | `9000` | Host port for MinIO S3 API |
+| `HOST_PORT_MINIO_CONSOLE` | `9001` | Host port for MinIO Web UI |
+
+> Internal ports (container-to-container) are hardcoded in `docker-compose.yml` and should not be changed.
+
+---
+
+## MinIO console
+
+Browse cached tiles at **http://localhost:9001** (or your `HOST_PORT_MINIO_CONSOLE`).
+
+Login with `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` from your `.env`.
+
+---
+
+## Useful commands
+
+```bash
+# View logs from all services
+docker compose logs -f
+
+# View logs from app replicas only
+docker compose logs -f ndvi-app
+
+# Stop everything (data is preserved in ./data/)
+docker compose down
+
+# Remove everything including data
+docker compose down -v
+rm -rf ./data/postgres ./data/minio
+```
