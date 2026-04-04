@@ -122,7 +122,8 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 				 date_acquired, index_type, width, height, minio_bucket, minio_key)
 			VALUES
 				(ST_MakeEnvelope($1,$2,$3,$4,4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10)
-			ON CONFLICT ON CONSTRAINT idx_tile_cache_lookup DO NOTHING`
+			ON CONFLICT (bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
+			             date_acquired, index_type, width, height) DO NOTHING`
 
 		_, err = s.db.Exec(ctx, ins,
 			bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
