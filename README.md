@@ -2,27 +2,55 @@
 
 Stateless Go microservice that generates NDVI PNG tiles on-the-fly from Sentinel-2 satellite imagery.
 
+## Repository layout
+
+```
+geogoservice/
+├── app/                  # Go application
+│   ├── cmd/server/       # Entry point (main.go)
+│   ├── internal/
+│   │   ├── cache/        # PostGIS + MinIO tile cache
+│   │   ├── config/       # Env-based configuration
+│   │   ├── geo/          # GDAL reader, CRS transforms
+│   │   ├── handler/      # HTTP handlers
+│   │   ├── render/       # NDVI computation + colour map
+│   │   └── stac/         # Multi-provider STAC client
+│   ├── Dockerfile
+│   ├── go.mod
+│   └── go.sum
+├── migrations/           # SQL schema (auto-applied on first start)
+├── nginx/                # Nginx load-balancer config
+├── data/                 # Runtime data (gitignored)
+│   ├── postgres/         # PostGIS volume
+│   └── minio/            # MinIO volume
+├── docker-compose.yml
+├── Makefile
+└── .env.example
+```
+
 ## Architecture
 
 ```
 Client
   │
   ▼
-Nginx :80  (load balancer, rate limiter)
+Nginx :80  (load balancer, re-resolves Docker DNS every 5 s)
   │
   ├──▶ gogeoapp replica 1 :8080
   ├──▶ gogeoapp replica 2 :8080
   └──▶ gogeoapp replica 3 :8080
             │
-            ├── PostGIS  (tile cache index)
-            ├── MinIO    (PNG cache storage)
-            └── Planetary Computer STAC API  (satellite imagery)
+            ├── PostGIS          (tile cache index)
+            ├── MinIO            (PNG cache storage)
+            └── STAC providers   (satellite imagery)
+                 ├── Planetary Computer  (preferred, SAS token cache)
+                 └── AWS Earth Search    (public S3, no auth, fallback)
 ```
 
 **Request pipeline:**
 1. Transform bbox EPSG:3857 → EPSG:4326
 2. Check PostGIS cache → if hit, return PNG from MinIO immediately
-3. Query STAC API for least-cloudy Sentinel-2 scene
+3. Query STAC API for least-cloudy Sentinel-2 scene (tries preferred provider first, auto-falls back)
 4. Read only required pixels from COG via GDAL `/vsicurl/` (HTTP Range requests)
 5. Compute NDVI = (NIR − Red) / (NIR + Red)
 6. Apply colour map → encode PNG
@@ -46,7 +74,7 @@ cp .env.example .env
 ### 2. Start the stack
 
 ```bash
-docker compose up -d --scale gogeoapp=3
+make up          # runs make setup first, then docker compose up -d --scale gogeoapp=3
 ```
 
 Wait ~15 seconds for PostGIS and MinIO to become healthy, then verify:
@@ -89,7 +117,7 @@ Both the modern and the legacy GeoServer format are accepted simultaneously.
 
 - `200 OK` — PNG image (`image/png`)
 - `400 Bad Request` — invalid or missing parameters
-- `404 Not Found` — no Sentinel-2 scene found for the given bbox/date (cloud cover < 10%)
+- `404 Not Found` — no Sentinel-2 scene found for the given bbox/date (cloud cover < 20%)
 - `500 Internal Server Error` — GDAL or processing error
 
 ---
@@ -135,6 +163,19 @@ The easiest way is [bboxfinder.com](http://bboxfinder.com) — draw your area, s
 
 ---
 
+## STAC providers
+
+The service tries providers in order and automatically falls back if one fails.
+
+| Provider | `STAC_PROVIDER` value | Data source | Auth |
+|----------|-----------------------|-------------|------|
+| Microsoft Planetary Computer | `planetary-computer` (default) | Azure Blob COGs | SAS token (auto-refreshed every ~55 min) |
+| AWS Earth Search | `earth-search` | Public S3 (`sentinel-cogs`) | None |
+
+Set `STAC_PROVIDER` in `.env` to change the preferred provider. Fallback is automatic regardless of which is preferred.
+
+---
+
 ## Scaling
 
 Change the number of app replicas at any time without downtime:
@@ -161,6 +202,7 @@ Nginx automatically discovers new replicas via Docker DNS (re-resolves every 5 s
 | `MINIO_ACCESS_KEY` | `minioadmin` | MinIO access key |
 | `MINIO_SECRET_KEY` | — | MinIO secret key |
 | `MINIO_BUCKET` | `ndvi-tiles` | Bucket for cached PNG tiles |
+| `STAC_PROVIDER` | `planetary-computer` | Preferred STAC provider (`planetary-computer` or `earth-search`) |
 | `HOST_PORT_HTTP` | `80` | Host port for Nginx (public entry point) |
 | `HOST_PORT_DB` | `5432` | Host port for PostgreSQL |
 | `HOST_PORT_MINIO` | `9000` | Host port for MinIO S3 API |
@@ -175,6 +217,22 @@ Nginx automatically discovers new replicas via Docker DNS (re-resolves every 5 s
 Browse cached tiles at **http://localhost:9001** (or your `HOST_PORT_MINIO_CONSOLE`).
 
 Login with `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` from your `.env`.
+
+---
+
+## Makefile targets
+
+```bash
+make up           # setup + docker compose up -d --scale gogeoapp=3
+make down         # docker compose down
+make build        # rebuild Docker images
+make scale n=5    # change replica count without restart
+make logs         # tail logs from all services
+make test         # run Go unit tests inside container
+make tidy         # go mod tidy inside container
+make lint         # golangci-lint (requires local install)
+make setup        # create data/ dirs with correct permissions (runs automatically with make up)
+```
 
 ---
 
