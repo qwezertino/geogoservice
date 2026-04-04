@@ -21,7 +21,7 @@ import (
 func ReadBandWindow(cogURL string, bbox BBox, outW, outH int) ([]float32, error) {
 	vsicurlPath := "/vsicurl/" + cogURL
 
-	ds, err := godal.Open(vsicurlPath, godal.ReadOnly())
+	ds, err := godal.Open(vsicurlPath)
 	if err != nil {
 		return nil, fmt.Errorf("open COG %q via vsicurl: %w", cogURL, err)
 	}
@@ -63,9 +63,8 @@ func ReadBandWindow(cogURL string, bbox BBox, outW, outH int) ([]float32, error)
 	band := bands[0]
 
 	buf := make([]float32, outW*outH)
-	if err := band.Read(pixMinX, pixMinY, winW, winH, buf,
-		godal.SrcWindowSize(winW, winH),
-		godal.DstWindowSize(outW, outH),
+	if err := band.Read(pixMinX, pixMinY, buf, outW, outH,
+		godal.Window(winW, winH),
 	); err != nil {
 		return nil, fmt.Errorf("read band window from %q: %w", cogURL, err)
 	}
