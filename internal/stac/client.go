@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/qwezert/geogoservice/internal/geo"
@@ -23,10 +24,13 @@ const (
 
 	maxCloudCover = 20.0
 
-	// pcSignURL is the Planetary Computer SAS token signing endpoint.
-	// All Azure Blob Storage URLs returned by the PC STAC API must be signed
-	// before they can be accessed.
-	pcSignURL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
+	// pcTokenURL is the Planetary Computer collection-level SAS token endpoint.
+	// One token covers all assets in the collection and is valid for ~1 hour.
+	// This is more efficient than calling the per-URL /sign endpoint on every request.
+	pcTokenURL = "https://planetarycomputer.microsoft.com/api/sas/v1/token/" + Sentinel2Collection
+
+	// tokenExpiryBuffer is how early we refresh the token before it actually expires.
+	tokenExpiryBuffer = 5 * time.Minute
 
 	// searchWindowDays is the ±radius around the requested date used when searching
 	// for scenes. Sentinel-2 revisit period is ~5 days, so 15 days guarantees at
@@ -44,6 +48,12 @@ type BandURLs struct {
 type Client struct {
 	http    *http.Client
 	baseURL string
+
+	// SAS token cache — one collection-level token is shared across all requests
+	// to avoid calling the sign API on every tile render.
+	tokenMu      sync.Mutex
+	cachedToken  string
+	tokenExpires time.Time
 }
 
 // NewClient creates a new STAC Client targeting baseURL (defaults to Planetary Computer).
@@ -165,52 +175,83 @@ func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) 
 	}
 
 	// Planetary Computer requires SAS-signing all Azure Blob Storage URLs
-	// before they can be accessed. Without a signed token the storage returns 409.
-	redSigned, err := c.signHref(ctx, best.Assets.B04.Href)
+	// before they can be accessed. We use a cached collection-level token to
+	// avoid one HTTP round-trip to the sign API per URL per request.
+	token, err := c.getToken(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("sign Red band URL: %w", err)
-	}
-	nirSigned, err := c.signHref(ctx, best.Assets.B08.Href)
-	if err != nil {
-		return nil, fmt.Errorf("sign NIR band URL: %w", err)
+		return nil, fmt.Errorf("fetch SAS token: %w", err)
 	}
 
 	return &BandURLs{
-		RedURL: redSigned,
-		NIRURL: nirSigned,
+		RedURL: applyToken(best.Assets.B04.Href, token),
+		NIRURL: applyToken(best.Assets.B08.Href, token),
 	}, nil
 }
 
-// signHref calls the Planetary Computer SAS signing endpoint and returns the
-// signed URL that can be used directly with GDAL /vsicurl/.
-func (c *Client) signHref(ctx context.Context, href string) (string, error) {
-	signEndpoint := pcSignURL + "?href=" + url.QueryEscape(href)
+// getToken returns a valid SAS token for the Sentinel-2 collection, refreshing
+// it from the Planetary Computer API when it has expired (or is about to).
+// The token is cached in the Client and protected by a mutex so concurrent
+// requests share a single token without stampeding the token endpoint.
+func (c *Client) getToken(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, signEndpoint, nil)
+	if c.cachedToken != "" && time.Now().Before(c.tokenExpires) {
+		return c.cachedToken, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pcTokenURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("build sign request: %w", err)
+		return "", fmt.Errorf("build token request: %w", err)
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("sign HTTP request: %w", err)
+		return "", fmt.Errorf("token HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("PC sign API returned HTTP %d for %q", resp.StatusCode, href)
+		return "", fmt.Errorf("PC token API returned HTTP %d", resp.StatusCode)
 	}
 
-	var signed struct {
-		Href string `json:"href"`
+	var tokenResp struct {
+		Token  string `json:"token"`
+		Expiry string `json:"msft:expiry"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&signed); err != nil {
-		return "", fmt.Errorf("decode sign response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return "", fmt.Errorf("decode token response: %w", err)
 	}
-	if signed.Href == "" {
-		return "", fmt.Errorf("PC sign API returned empty href for %q", href)
+
+	expiry, err := time.Parse(time.RFC3339, tokenResp.Expiry)
+	if err != nil {
+		// If we can't parse expiry, treat token as valid for 30 minutes.
+		expiry = time.Now().Add(30 * time.Minute)
 	}
-	return signed.Href, nil
+
+	c.cachedToken = tokenResp.Token
+	c.tokenExpires = expiry.Add(-tokenExpiryBuffer)
+	return c.cachedToken, nil
+}
+
+// applyToken appends the SAS token as a query string to an Azure Blob URL.
+func applyToken(href, token string) string {
+	if token == "" {
+		return href
+	}
+	parsed, err := url.Parse(href)
+	if err != nil {
+		return href + "?" + token
+	}
+	// Preserve any existing query params (there shouldn't be any from STAC),
+	// then append the token.
+	existing := parsed.RawQuery
+	if existing != "" {
+		parsed.RawQuery = existing + "&" + token
+	} else {
+		parsed.RawQuery = token
+	}
+	return parsed.String()
 }
 
 // bytesReader is a helper to turn []byte into an io.Reader without importing bytes.
