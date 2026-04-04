@@ -20,7 +20,12 @@ const (
 	// Sentinel2Collection is the Sentinel-2 Level-2A collection identifier.
 	Sentinel2Collection = "sentinel-2-l2a"
 
-	maxCloudCover = 10.0
+	maxCloudCover = 20.0
+
+	// searchWindowDays is the ±radius around the requested date used when searching
+	// for scenes. Sentinel-2 revisit period is ~5 days, so 15 days guarantees at
+	// least 3 overpasses to choose from.
+	searchWindowDays = 15
 )
 
 // BandURLs holds the HTTPS/S3 URLs for the Red (B04) and NIR (B08) bands.
@@ -55,7 +60,13 @@ type stacSearchRequest struct {
 	Datetime    string                 `json:"datetime"`
 	BBox        [4]float64             `json:"bbox"`
 	Query       map[string]interface{} `json:"query"`
+	SortBy      []stacSortBy           `json:"sortby"`
 	Limit       int                    `json:"limit"`
+}
+
+type stacSortBy struct {
+	Field     string `json:"field"`
+	Direction string `json:"direction"`
 }
 
 // stacSearchResponse is a partial deserialisation of the GeoJSON FeatureCollection
@@ -78,11 +89,19 @@ type stacAsset struct {
 }
 
 // FindBestScene queries the STAC API for the least-cloudy Sentinel-2 scene that
-// intersects bbox (EPSG:4326) on date (YYYY-MM-DD). It returns the COG URLs for
-// the Red and NIR bands of the best matching scene.
+// intersects bbox (EPSG:4326) closest to date (YYYY-MM-DD). It searches a
+// ±searchWindowDays window around the requested date and returns the COG URLs
+// for the Red and NIR bands of the best matching scene.
 func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) (*BandURLs, error) {
-	// Build a full-day datetime interval
-	datetime := fmt.Sprintf("%sT00:00:00Z/%sT23:59:59Z", date, date)
+	// Parse the requested date and build a ±searchWindowDays interval.
+	requestedDate, err := time.Parse(time.DateOnly, date)
+	if err != nil {
+		return nil, fmt.Errorf("invalid date %q: %w", date, err)
+	}
+	from := requestedDate.AddDate(0, 0, -searchWindowDays)
+	to := requestedDate.AddDate(0, 0, searchWindowDays)
+	datetime := fmt.Sprintf("%sT00:00:00Z/%sT23:59:59Z",
+		from.Format(time.DateOnly), to.Format(time.DateOnly))
 
 	body := stacSearchRequest{
 		Collections: []string{Sentinel2Collection},
@@ -93,7 +112,10 @@ func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) 
 				"lt": maxCloudCover,
 			},
 		},
-		Limit: 5,
+		SortBy: []stacSortBy{
+			{Field: "properties.eo:cloud_cover", Direction: "asc"},
+		},
+		Limit: 20,
 	}
 
 	reqBytes, err := json.Marshal(body)
@@ -125,8 +147,8 @@ func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) 
 	}
 
 	if len(result.Features) == 0 {
-		return nil, fmt.Errorf("no Sentinel-2 scenes found for bbox=%v date=%s (cloud<%.0f%%)",
-			bbox, date, maxCloudCover)
+		return nil, fmt.Errorf("no Sentinel-2 scenes found for bbox=%v date=%s ±%dd (cloud<%.0f%%)",
+			bbox, date, searchWindowDays, maxCloudCover)
 	}
 
 	// Pick the first feature (STAC returns them ordered by cloud cover ascending
