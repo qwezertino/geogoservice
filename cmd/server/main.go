@@ -44,7 +44,7 @@ func run() error {
 	}
 	defer store.Close()
 
-	stacClient := stac.NewClient("") // defaults to Planetary Computer
+	stacClient := stac.NewClient(cfg.STACProvider, nil)
 
 	mux := http.NewServeMux()
 

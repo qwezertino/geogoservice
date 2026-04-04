@@ -22,6 +22,12 @@ type Config struct {
 	MinioSecretKey string
 	MinioBucket    string
 	MinioUseSSL    bool
+
+	// STACProvider controls which satellite data provider is used first.
+	// Accepted values: "planetary-computer" (default), "earth-search".
+	// If the preferred provider fails, the service automatically falls back
+	// to the next registered provider.
+	STACProvider string
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -44,6 +50,11 @@ func Load() (*Config, error) {
 		port = "8080"
 	}
 
+	stacProvider := os.Getenv("STAC_PROVIDER")
+	if stacProvider == "" {
+		stacProvider = "planetary-computer"
+	}
+
 	return &Config{
 		Port:           port,
 		DBHost:         os.Getenv("DB_HOST"),
@@ -56,6 +67,7 @@ func Load() (*Config, error) {
 		MinioSecretKey: os.Getenv("MINIO_SECRET_KEY"),
 		MinioBucket:    os.Getenv("MINIO_BUCKET"),
 		MinioUseSSL:    useSSL,
+		STACProvider:   stacProvider,
 	}, nil
 }
 

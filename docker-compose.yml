@@ -15,6 +15,8 @@ x-app-env: &app-env
   CPL_VSIL_CURL_ALLOWED_EXTENSIONS: ".tif,.tiff"
   GDAL_DISABLE_READDIR_ON_OPEN: "EMPTY_DIR"
   PORT: "8080"                  # internal container port – never changes
+  # STAC provider: "planetary-computer" (default) or "earth-search"
+  STAC_PROVIDER: ${STAC_PROVIDER:-planetary-computer}
 
 services:
   # ── PostGIS ─────────────────────────────────────────────────────────────────
