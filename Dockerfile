@@ -1,34 +1,22 @@
 # ─── Build Stage ──────────────────────────────────────────────────────────────
-FROM ubuntu:22.04 AS builder
+# golang:alpine already ships with Go – no manual installation needed.
+FROM golang:1.22-alpine3.19 AS builder
 
-ENV DEBIAN_FRONTEND=noninteractive
+# build-base  = gcc, make, musl-dev (needed for CGO)
+# gdal-dev    = GDAL headers + shared lib (pulls gdal transitively)
+# pkgconfig   = lets cgo locate gdal via pkg-config
+RUN apk add --no-cache \
+        build-base \
+        gdal-dev \
+        pkgconfig
 
-# Install GDAL dev libs + Go build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        curl \
-        git \
-        libgdal-dev \
-        gdal-bin \
-        pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Go 1.22
-ENV GO_VERSION=1.22.2
-RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
-    | tar -C /usr/local -xz
-ENV PATH="/usr/local/go/bin:${PATH}"
-ENV GOPATH=/go
 ENV CGO_ENABLED=1
-
 WORKDIR /src
 
-# Cache Go module downloads separately from source
+# Cache module downloads as a separate layer
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source and build a statically-linked (but CGO-enabled) binary
 COPY . .
 RUN go build \
         -ldflags="-s -w" \
@@ -36,18 +24,17 @@ RUN go build \
         ./cmd/server
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
-FROM ubuntu:22.04 AS runtime
+FROM alpine:3.19 AS runtime
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# gdal       = shared libraries required at runtime
+# ca-certificates = needed for HTTPS calls (STAC API, /vsicurl/)
+RUN apk add --no-cache \
         ca-certificates \
-        libgdal-dev \
-        gdal-bin \
-    && rm -rf /var/lib/apt/lists/*
+        gdal
 
 # Non-root user for defence-in-depth
-RUN groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appuser
+RUN addgroup -S appgroup && \
+    adduser -S -G appgroup -h /app -s /sbin/nologin appuser
 
 WORKDIR /app
 COPY --from=builder /app/geogoservice .
