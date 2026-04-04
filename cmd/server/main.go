@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/airbusgeo/godal"
 	"github.com/qwezert/geogoservice/internal/cache"
 	"github.com/qwezert/geogoservice/internal/config"
 	"github.com/qwezert/geogoservice/internal/handler"
@@ -25,6 +26,9 @@ func main() {
 }
 
 func run() error {
+	// Register all GDAL drivers and VSI handlers (GTiff, /vsicurl/, etc.)
+	godal.RegisterAll()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)

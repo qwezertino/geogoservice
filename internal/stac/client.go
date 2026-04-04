@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/qwezert/geogoservice/internal/geo"
@@ -21,6 +22,11 @@ const (
 	Sentinel2Collection = "sentinel-2-l2a"
 
 	maxCloudCover = 20.0
+
+	// pcSignURL is the Planetary Computer SAS token signing endpoint.
+	// All Azure Blob Storage URLs returned by the PC STAC API must be signed
+	// before they can be accessed.
+	pcSignURL = "https://planetarycomputer.microsoft.com/api/sas/v1/sign"
 
 	// searchWindowDays is the ±radius around the requested date used when searching
 	// for scenes. Sentinel-2 revisit period is ~5 days, so 15 days guarantees at
@@ -158,10 +164,53 @@ func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) 
 		return nil, fmt.Errorf("selected STAC scene is missing B04 or B08 asset URLs")
 	}
 
+	// Planetary Computer requires SAS-signing all Azure Blob Storage URLs
+	// before they can be accessed. Without a signed token the storage returns 409.
+	redSigned, err := c.signHref(ctx, best.Assets.B04.Href)
+	if err != nil {
+		return nil, fmt.Errorf("sign Red band URL: %w", err)
+	}
+	nirSigned, err := c.signHref(ctx, best.Assets.B08.Href)
+	if err != nil {
+		return nil, fmt.Errorf("sign NIR band URL: %w", err)
+	}
+
 	return &BandURLs{
-		RedURL: best.Assets.B04.Href,
-		NIRURL: best.Assets.B08.Href,
+		RedURL: redSigned,
+		NIRURL: nirSigned,
 	}, nil
+}
+
+// signHref calls the Planetary Computer SAS signing endpoint and returns the
+// signed URL that can be used directly with GDAL /vsicurl/.
+func (c *Client) signHref(ctx context.Context, href string) (string, error) {
+	signEndpoint := pcSignURL + "?href=" + url.QueryEscape(href)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, signEndpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("build sign request: %w", err)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("sign HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("PC sign API returned HTTP %d for %q", resp.StatusCode, href)
+	}
+
+	var signed struct {
+		Href string `json:"href"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&signed); err != nil {
+		return "", fmt.Errorf("decode sign response: %w", err)
+	}
+	if signed.Href == "" {
+		return "", fmt.Errorf("PC sign API returned empty href for %q", href)
+	}
+	return signed.Href, nil
 }
 
 // bytesReader is a helper to turn []byte into an io.Reader without importing bytes.
