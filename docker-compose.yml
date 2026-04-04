@@ -69,8 +69,8 @@ services:
       "
     restart: "no"
 
-  # ── Go service (scale with: docker compose up -d --scale ndvi-app=N) ────────
-  ndvi-app:
+  # ── Go service (scale with: docker compose up -d --scale gogeoapp=N) ────────
+  gogeoapp:
     build: .
     restart: unless-stopped
     environment:
@@ -92,6 +92,6 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - ndvi-app
+      - gogeoapp
 
 # Data is persisted in ./data/ — stop/start containers freely without data loss.

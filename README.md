@@ -10,9 +10,9 @@ Client
   ▼
 Nginx :80  (load balancer, rate limiter)
   │
-  ├──▶ ndvi-app replica 1 :8080
-  ├──▶ ndvi-app replica 2 :8080
-  └──▶ ndvi-app replica 3 :8080
+  ├──▶ gogeoapp replica 1 :8080
+  ├──▶ gogeoapp replica 2 :8080
+  └──▶ gogeoapp replica 3 :8080
             │
             ├── PostGIS  (tile cache index)
             ├── MinIO    (PNG cache storage)
@@ -46,7 +46,7 @@ cp .env.example .env
 ### 2. Start the stack
 
 ```bash
-docker compose up -d --scale ndvi-app=3
+docker compose up -d --scale gogeoapp=3
 ```
 
 Wait ~15 seconds for PostGIS and MinIO to become healthy, then verify:
@@ -141,7 +141,7 @@ Change the number of app replicas at any time without downtime:
 
 ```bash
 # Scale up to 5 replicas
-docker compose up -d --scale ndvi-app=5
+docker compose up -d --scale gogeoapp=5
 
 # Or use the Makefile shortcut
 make scale n=5
@@ -185,7 +185,7 @@ Login with `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` from your `.env`.
 docker compose logs -f
 
 # View logs from app replicas only
-docker compose logs -f ndvi-app
+docker compose logs -f gogeoapp
 
 # Stop everything (data is preserved in ./data/)
 docker compose down
