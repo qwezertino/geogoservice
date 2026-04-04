@@ -25,6 +25,9 @@ services:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
+      # Store data in a subdirectory so .gitkeep at the mount root doesn't
+      # interfere with initdb's "directory must be empty" check.
+      PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       - "${HOST_PORT_DB:-5432}:5432"  # change HOST_PORT_DB in .env to remap
     volumes:

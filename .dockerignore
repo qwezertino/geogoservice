@@ -1,0 +1,10 @@
+# Never send local data directories or secrets into the Docker build context
+data/
+.env
+
+# Git metadata
+.git/
+
+# Editor
+.idea/
+.vscode/
