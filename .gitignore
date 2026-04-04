@@ -1,6 +1,6 @@
-# Compiled binary
-/geogoservice
-/cmd/server/server
+# Compiled binary (local dev builds inside app/)
+app/geogoservice
+app/cmd/server/server
 
 # Go module cache
 vendor/

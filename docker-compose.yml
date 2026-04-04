@@ -80,7 +80,7 @@ services:
 
   # ── Go service (scale with: docker compose up -d --scale gogeoapp=N) ────────
   gogeoapp:
-    build: .
+    build: ./app
     restart: unless-stopped
     environment:
       <<: *app-env

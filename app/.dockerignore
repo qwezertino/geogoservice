@@ -1,0 +1,7 @@
+# Build context is ./app — only Go source goes to the daemon.
+# data/, .env, .git/ live at the repo root, so they're already excluded.
+
+# Editor artifacts
+.idea/
+.vscode/
+
