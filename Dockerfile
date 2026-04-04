@@ -1,6 +1,6 @@
 # ─── Build Stage ──────────────────────────────────────────────────────────────
 # golang:alpine already ships with Go – no manual installation needed.
-FROM golang:1.22-alpine3.19 AS builder
+FROM golang:1.23-alpine3.21 AS builder
 
 # build-base  = gcc, make, musl-dev (needed for CGO)
 # gdal-dev    = GDAL headers + shared lib (pulls gdal transitively)
@@ -24,7 +24,7 @@ RUN go build \
         ./cmd/server
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
-FROM alpine:3.19 AS runtime
+FROM alpine:3.21 AS runtime
 
 # gdal       = shared libraries required at runtime
 # ca-certificates = needed for HTTPS calls (STAC API, /vsicurl/)
