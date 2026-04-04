@@ -1,11 +1,16 @@
-.PHONY: build up down scale tidy lint test
+.PHONY: build up down scale tidy lint test setup
+
+## setup: prepare data directories with correct permissions (run once after git clone)
+setup:
+	mkdir -p data/postgres data/minio
+	chmod 777 data/postgres data/minio
 
 ## build: build all Docker images
 build:
 	docker compose build
 
 ## up: start the full stack with 3 replicas (default)
-up:
+up: setup
 	docker compose up -d --scale gogeoapp=3
 
 ## scale n=N: change the number of running app replicas on-the-fly
