@@ -112,6 +112,8 @@ Both the modern and the legacy GeoServer format are accepted simultaneously.
 | height | `h=256` | `height=256` | Output image height in pixels (1–2048) |
 | index | `index=ndvi` | `indexName=ndvi` | Spectral index (only `ndvi` supported) |
 | srs | `srs=EPSG:3857` | — | CRS (optional, only EPSG:3857 accepted) |
+| window | `window=15` | — | Search window ±N days around `date` (overrides `STAC_SEARCH_WINDOW_DAYS`) |
+| cloud | `cloud=20` | — | Max cloud cover % 0–100 (overrides `STAC_MAX_CLOUD_COVER`) |
 
 #### Response
 
@@ -127,14 +129,21 @@ Both the modern and the legacy GeoServer format are accepted simultaneously.
 ### Modern format — Berlin area, 256×256 tile
 
 ```bash
-curl "http://localhost/api/render?bbox=1486000,6890000,1500000,6900000&date=2024-06-15&w=256&h=256" \
+curl "http://localhost:7001/api/render?bbox=1486000,6890000,1500000,6900000&date=2024-06-15&w=256&h=256" \
   --output berlin_ndvi.png
+```
+
+### Narrow search — only ±3 days, max 5% cloud cover
+
+```bash
+curl "http://localhost:7001/api/render?bbox=1486000,6890000,1500000,6900000&date=2024-06-15&w=256&h=256&window=3&cloud=5" \
+  --output berlin_ndvi_clear.png
 ```
 
 ### Legacy GeoServer format (drop-in replacement)
 
 ```bash
-curl "http://localhost/api/render?box[0]=1486000&box[1]=6890000&box[2]=1500000&box[3]=6900000&date=1718409600&width=256&height=256&indexName=ndvi" \
+curl "http://localhost:7001/api/render?box[0]=1486000&box[1]=6890000&box[2]=1500000&box[3]=6900000&date=1718409600&width=256&height=256&indexName=ndvi" \
   --output berlin_ndvi.png
 ```
 
@@ -143,7 +152,7 @@ curl "http://localhost/api/render?box[0]=1486000&box[1]=6890000&box[2]=1500000&b
 ### Paris area, 512×512 tile
 
 ```bash
-curl "http://localhost/api/render?bbox=261000,6241000,272000,6251000&date=2024-07-01&w=512&h=512" \
+curl "http://localhost:7001/api/render?bbox=261000,6241000,272000,6251000&date=2024-07-01&w=512&h=512" \
   --output paris_ndvi.png
 ```
 
@@ -203,6 +212,8 @@ Nginx automatically discovers new replicas via Docker DNS (re-resolves every 5 s
 | `MINIO_SECRET_KEY` | — | MinIO secret key |
 | `MINIO_BUCKET` | `ndvi-tiles` | Bucket for cached PNG tiles |
 | `STAC_PROVIDER` | `planetary-computer` | Preferred STAC provider (`planetary-computer` or `earth-search`) |
+| `STAC_SEARCH_WINDOW_DAYS` | `15` | Default ±N day search window (overridable per-request via `window=`) |
+| `STAC_MAX_CLOUD_COVER` | `20` | Default max cloud cover % (overridable per-request via `cloud=`) |
 | `HOST_PORT_HTTP` | `80` | Host port for Nginx (public entry point) |
 | `HOST_PORT_DB` | `5432` | Host port for PostgreSQL |
 | `HOST_PORT_MINIO` | `9000` | Host port for MinIO S3 API |
