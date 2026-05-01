@@ -44,7 +44,10 @@ func run() error {
 	}
 	defer store.Close()
 
-	stacClient := stac.NewClient(cfg.STACProvider, nil)
+	stacClient := stac.NewClient(cfg.STACProvider, nil, stac.ClientOptions{
+		SearchWindowDays: cfg.STACSearchWindowDays,
+		MaxCloudCover:    cfg.STACMaxCloudCover,
+	})
 
 	mux := http.NewServeMux()
 

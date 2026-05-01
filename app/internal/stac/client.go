@@ -25,11 +25,8 @@ const (
 	// Sentinel2Collection is the Sentinel-2 Level-2A collection ID used by all providers.
 	Sentinel2Collection = "sentinel-2-l2a"
 
-	maxCloudCover = 20.0
-
-	// searchWindowDays is the ±radius around the requested date. Sentinel-2
-	// revisit period is ~5 days, so 15 days guarantees ≥3 overpasses.
-	searchWindowDays = 15
+	defaultSearchWindowDays = 15
+	defaultMaxCloudCover    = 20.0
 )
 
 // BandURLs holds the ready-to-use (signed if necessary) HTTPS/S3 URLs for the
@@ -48,25 +45,48 @@ type Provider interface {
 	// Name returns the human-readable identifier used in logs.
 	Name() string
 	// FindBestScene returns COG URLs for the least-cloudy Sentinel-2 scene
-	// that intersects bbox (EPSG:4326) within ±searchWindowDays of date.
-	FindBestScene(ctx context.Context, bbox geo.BBox, date string) (*BandURLs, error)
+	// that intersects bbox (EPSG:4326) within ±windowDays of date,
+	// filtered to scenes with cloud cover below maxCloud.
+	FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error)
 }
 
 // Client holds an ordered list of providers and retries each one in turn,
 // returning the first successful result (automatic fallback).
 type Client struct {
-	providers []Provider
+	providers        []Provider
+	searchWindowDays int
+	maxCloudCover    float64
+}
+
+// ClientOptions holds optional tuning parameters for the STAC client.
+type ClientOptions struct {
+	// SearchWindowDays is the ±radius (in days) around the requested date.
+	// Sentinel-2 revisit period is ~5 days; 15 days guarantees ≥3 overpasses.
+	// Defaults to 15 when zero.
+	SearchWindowDays int
+	// MaxCloudCover is the maximum acceptable cloud cover percentage (0–100).
+	// Defaults to 20 when zero.
+	MaxCloudCover float64
 }
 
 // NewClient builds a Client with providers ordered so that preferredName is
 // tried first. All known providers are registered so fallback is always
 // available even if the preferred one is unavailable.
-func NewClient(preferredName string, httpClient *http.Client) *Client {
+func NewClient(preferredName string, httpClient *http.Client, opts ClientOptions) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: &http.Transport{MaxIdleConnsPerHost: 10},
 		}
+	}
+
+	searchWindow := opts.SearchWindowDays
+	if searchWindow <= 0 {
+		searchWindow = defaultSearchWindowDays
+	}
+	maxCloud := opts.MaxCloudCover
+	if maxCloud <= 0 {
+		maxCloud = defaultMaxCloudCover
 	}
 
 	pc := newPlanetaryComputerProvider(httpClient)
@@ -79,7 +99,11 @@ func NewClient(preferredName string, httpClient *http.Client) *Client {
 		ordered = []Provider{es, pc}
 	}
 
-	return &Client{providers: ordered}
+	return &Client{
+		providers:        ordered,
+		searchWindowDays: searchWindow,
+		maxCloudCover:    maxCloud,
+	}
 }
 
 // FindBestScene tries each registered provider in order, returning the first
@@ -88,7 +112,7 @@ func NewClient(preferredName string, httpClient *http.Client) *Client {
 func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) (*BandURLs, error) {
 	var lastErr error
 	for _, p := range c.providers {
-		result, err := p.FindBestScene(ctx, bbox, date)
+		result, err := p.FindBestScene(ctx, bbox, date, c.searchWindowDays, c.maxCloudCover)
 		if err == nil {
 			return result, nil
 		}
@@ -131,14 +155,14 @@ type stacAsset struct {
 }
 
 // buildDatetimeInterval returns the STAC datetime range string for a
-// ±searchWindowDays window around the given YYYY-MM-DD date.
-func buildDatetimeInterval(date string) (string, error) {
+// ±windowDays window around the given YYYY-MM-DD date.
+func buildDatetimeInterval(date string, windowDays int) (string, error) {
 	d, err := time.Parse(time.DateOnly, date)
 	if err != nil {
 		return "", fmt.Errorf("invalid date %q: %w", date, err)
 	}
-	from := d.AddDate(0, 0, -searchWindowDays)
-	to := d.AddDate(0, 0, searchWindowDays)
+	from := d.AddDate(0, 0, -windowDays)
+	to := d.AddDate(0, 0, windowDays)
 	return fmt.Sprintf("%sT00:00:00Z/%sT23:59:59Z",
 		from.Format(time.DateOnly), to.Format(time.DateOnly)), nil
 }

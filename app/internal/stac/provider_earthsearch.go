@@ -25,8 +25,8 @@ func newEarthSearchProvider(hc *http.Client) *earthSearchProvider {
 
 func (p *earthSearchProvider) Name() string { return ProviderEarthSearch }
 
-func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, date string) (*BandURLs, error) {
-	datetime, err := buildDatetimeInterval(date)
+func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
+	datetime, err := buildDatetimeInterval(date, windowDays)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +36,7 @@ func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, 
 		Datetime:    datetime,
 		BBox:        [4]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY},
 		Query: map[string]interface{}{
-			"eo:cloud_cover": map[string]interface{}{"lt": maxCloudCover},
+			"eo:cloud_cover": map[string]interface{}{"lt": maxCloud},
 		},
 		SortBy: []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
 		Limit:  20,

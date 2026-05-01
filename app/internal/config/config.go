@@ -28,6 +28,14 @@ type Config struct {
 	// If the preferred provider fails, the service automatically falls back
 	// to the next registered provider.
 	STACProvider string
+
+	// STACSearchWindowDays is the ±radius (in days) around the requested date
+	// when querying for Sentinel-2 scenes. Default: 15.
+	STACSearchWindowDays int
+
+	// STACMaxCloudCover is the maximum acceptable cloud cover percentage (0–100).
+	// Default: 20.
+	STACMaxCloudCover float64
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -55,19 +63,35 @@ func Load() (*Config, error) {
 		stacProvider = "planetary-computer"
 	}
 
+	searchWindow := 15
+	if v := os.Getenv("STAC_SEARCH_WINDOW_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			searchWindow = n
+		}
+	}
+
+	maxCloud := 20.0
+	if v := os.Getenv("STAC_MAX_CLOUD_COVER"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
+			maxCloud = f
+		}
+	}
+
 	return &Config{
-		Port:           port,
-		DBHost:         os.Getenv("DB_HOST"),
-		DBPort:         os.Getenv("DB_PORT"),
-		DBUser:         os.Getenv("DB_USER"),
-		DBPassword:     os.Getenv("DB_PASSWORD"),
-		DBName:         os.Getenv("DB_NAME"),
-		MinioEndpoint:  os.Getenv("MINIO_ENDPOINT"),
-		MinioAccessKey: os.Getenv("MINIO_ACCESS_KEY"),
-		MinioSecretKey: os.Getenv("MINIO_SECRET_KEY"),
-		MinioBucket:    os.Getenv("MINIO_BUCKET"),
-		MinioUseSSL:    useSSL,
-		STACProvider:   stacProvider,
+		Port:                 port,
+		DBHost:               os.Getenv("DB_HOST"),
+		DBPort:               os.Getenv("DB_PORT"),
+		DBUser:               os.Getenv("DB_USER"),
+		DBPassword:           os.Getenv("DB_PASSWORD"),
+		DBName:               os.Getenv("DB_NAME"),
+		MinioEndpoint:        os.Getenv("MINIO_ENDPOINT"),
+		MinioAccessKey:       os.Getenv("MINIO_ACCESS_KEY"),
+		MinioSecretKey:       os.Getenv("MINIO_SECRET_KEY"),
+		MinioBucket:          os.Getenv("MINIO_BUCKET"),
+		MinioUseSSL:          useSSL,
+		STACProvider:         stacProvider,
+		STACSearchWindowDays: searchWindow,
+		STACMaxCloudCover:    maxCloud,
 	}, nil
 }
 

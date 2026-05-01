@@ -17,6 +17,10 @@ x-app-env: &app-env
   PORT: "8080"                  # internal container port – never changes
   # STAC provider: "planetary-computer" (default) or "earth-search"
   STAC_PROVIDER: ${STAC_PROVIDER:-planetary-computer}
+  # Scene search window: ±N days around the requested date (default 15)
+  STAC_SEARCH_WINDOW_DAYS: ${STAC_SEARCH_WINDOW_DAYS:-15}
+  # Maximum acceptable cloud cover percent 0–100 (default 20)
+  STAC_MAX_CLOUD_COVER: ${STAC_MAX_CLOUD_COVER:-20}
 
 services:
   # ── PostGIS ─────────────────────────────────────────────────────────────────
