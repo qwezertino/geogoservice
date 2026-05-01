@@ -53,40 +53,18 @@ type Provider interface {
 // Client holds an ordered list of providers and retries each one in turn,
 // returning the first successful result (automatic fallback).
 type Client struct {
-	providers        []Provider
-	searchWindowDays int
-	maxCloudCover    float64
-}
-
-// ClientOptions holds optional tuning parameters for the STAC client.
-type ClientOptions struct {
-	// SearchWindowDays is the ±radius (in days) around the requested date.
-	// Sentinel-2 revisit period is ~5 days; 15 days guarantees ≥3 overpasses.
-	// Defaults to 15 when zero.
-	SearchWindowDays int
-	// MaxCloudCover is the maximum acceptable cloud cover percentage (0–100).
-	// Defaults to 20 when zero.
-	MaxCloudCover float64
+	providers []Provider
 }
 
 // NewClient builds a Client with providers ordered so that preferredName is
 // tried first. All known providers are registered so fallback is always
 // available even if the preferred one is unavailable.
-func NewClient(preferredName string, httpClient *http.Client, opts ClientOptions) *Client {
+func NewClient(preferredName string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: &http.Transport{MaxIdleConnsPerHost: 10},
 		}
-	}
-
-	searchWindow := opts.SearchWindowDays
-	if searchWindow <= 0 {
-		searchWindow = defaultSearchWindowDays
-	}
-	maxCloud := opts.MaxCloudCover
-	if maxCloud <= 0 {
-		maxCloud = defaultMaxCloudCover
 	}
 
 	pc := newPlanetaryComputerProvider(httpClient)
@@ -99,20 +77,16 @@ func NewClient(preferredName string, httpClient *http.Client, opts ClientOptions
 		ordered = []Provider{es, pc}
 	}
 
-	return &Client{
-		providers:        ordered,
-		searchWindowDays: searchWindow,
-		maxCloudCover:    maxCloud,
-	}
+	return &Client{providers: ordered}
 }
 
 // FindBestScene tries each registered provider in order, returning the first
-// successful result. Failures are logged so operators can see which provider
-// was used and why a fallback occurred.
-func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string) (*BandURLs, error) {
+// successful result. windowDays and maxCloud are passed per-request so callers
+// can override them without rebuilding the client.
+func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
 	var lastErr error
 	for _, p := range c.providers {
-		result, err := p.FindBestScene(ctx, bbox, date, c.searchWindowDays, c.maxCloudCover)
+		result, err := p.FindBestScene(ctx, bbox, date, windowDays, maxCloud)
 		if err == nil {
 			return result, nil
 		}

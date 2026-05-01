@@ -30,11 +30,34 @@ import (
 type RenderHandler struct {
 	store      *cache.Store
 	stacClient *stac.Client
+
+	// Default STAC search parameters — overridable per-request via query string.
+	defaultSearchWindowDays int
+	defaultMaxCloudCover    float64
+}
+
+// HandlerOptions carries configurable defaults for the render handler.
+type HandlerOptions struct {
+	DefaultSearchWindowDays int
+	DefaultMaxCloudCover    float64
 }
 
 // New creates a RenderHandler with the given dependencies.
-func New(store *cache.Store, stacClient *stac.Client) *RenderHandler {
-	return &RenderHandler{store: store, stacClient: stacClient}
+func New(store *cache.Store, stacClient *stac.Client, opts HandlerOptions) *RenderHandler {
+	searchWindow := opts.DefaultSearchWindowDays
+	if searchWindow <= 0 {
+		searchWindow = 15
+	}
+	maxCloud := opts.DefaultMaxCloudCover
+	if maxCloud <= 0 {
+		maxCloud = 20.0
+	}
+	return &RenderHandler{
+		store:                   store,
+		stacClient:              stacClient,
+		defaultSearchWindowDays: searchWindow,
+		defaultMaxCloudCover:    maxCloud,
+	}
 }
 
 // ServeHTTP handles GET /api/render requests.
@@ -46,7 +69,7 @@ func (rh *RenderHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params, err := parseParams(r)
+	params, err := parseParams(r, rh.defaultSearchWindowDays, rh.defaultMaxCloudCover)
 	if err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
@@ -81,7 +104,7 @@ func (rh *RenderHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── 3. STAC query ────────────────────────────────────────────────────────
-	bands, err := rh.stacClient.FindBestScene(ctx, bbox4326, params.date)
+	bands, err := rh.stacClient.FindBestScene(ctx, bbox4326, params.date, params.searchWindowDays, params.maxCloudCover)
 	if err != nil {
 		http.Error(w, "no satellite imagery found: "+err.Error(), http.StatusNotFound)
 		fmt.Printf("[handler] STAC query: %v\n", err)
@@ -136,14 +159,18 @@ func writePNG(w http.ResponseWriter, data []byte) {
 
 // renderParams holds validated, parsed request parameters.
 type renderParams struct {
-	bbox3857 geo.BBox
-	date     string
-	index    string
-	w, h     int
+	bbox3857         geo.BBox
+	date             string
+	index            string
+	w, h             int
+	searchWindowDays int
+	maxCloudCover    float64
 }
 
 // parseParams accepts both the modern and legacy GeoServer parameter formats.
-func parseParams(r *http.Request) (*renderParams, error) {
+// defaultWindow and defaultCloud are used when the caller does not supply
+// the corresponding query parameters.
+func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*renderParams, error) {
 	q := r.URL.Query()
 
 	// ── bbox ─────────────────────────────────────────────────────────────────
@@ -191,12 +218,35 @@ func parseParams(r *http.Request) (*renderParams, error) {
 		return nil, fmt.Errorf("unsupported index %q; only 'ndvi' is supported", indexType)
 	}
 
+	// ── STAC search overrides ─────────────────────────────────────────────────
+	// window=N   — override search window in days
+	// cloud=N    — override max cloud cover percent
+	searchWindow := defaultWindow
+	if v := q.Get("window"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			searchWindow = n
+		} else {
+			return nil, fmt.Errorf("window must be a positive integer, got %q", v)
+		}
+	}
+
+	maxCloud := defaultCloud
+	if v := q.Get("cloud"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
+			maxCloud = f
+		} else {
+			return nil, fmt.Errorf("cloud must be a number in [0, 100], got %q", v)
+		}
+	}
+
 	return &renderParams{
-		bbox3857: bbox,
-		date:     dateStr,
-		index:    indexType,
-		w:        width,
-		h:        height,
+		bbox3857:         bbox,
+		date:             dateStr,
+		index:            indexType,
+		w:                width,
+		h:                height,
+		searchWindowDays: searchWindow,
+		maxCloudCover:    maxCloud,
 	}, nil
 }
 

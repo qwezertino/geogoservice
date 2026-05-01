@@ -44,15 +44,15 @@ func run() error {
 	}
 	defer store.Close()
 
-	stacClient := stac.NewClient(cfg.STACProvider, nil, stac.ClientOptions{
-		SearchWindowDays: cfg.STACSearchWindowDays,
-		MaxCloudCover:    cfg.STACMaxCloudCover,
-	})
+	stacClient := stac.NewClient(cfg.STACProvider, nil)
 
 	mux := http.NewServeMux()
 
 	// Core tile endpoint
-	renderHandler := handler.New(store, stacClient)
+	renderHandler := handler.New(store, stacClient, handler.HandlerOptions{
+		DefaultSearchWindowDays: cfg.STACSearchWindowDays,
+		DefaultMaxCloudCover:    cfg.STACMaxCloudCover,
+	})
 	mux.Handle("/api/render", renderHandler)
 
 	// Health check (used by Docker Compose and Nginx)
