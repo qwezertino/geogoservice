@@ -375,60 +375,71 @@ Set `STAC_PROVIDER` in `.env` to change the preferred provider. Fallback is auto
 
 ## Performance benchmarks
 
-Load tests run on a local machine with 3 app replicas (`make loadtest-up`),
-`STAC_PROVIDER=local` (synthetic COGs pre-loaded into MinIO, no external STAC
-calls), and the k6 scripts in `loadtest/k6/`.
+Tests run on a local developer machine with `STAC_PROVIDER=local` (synthetic
+COGs pre-loaded into MinIO, no external STAC calls).  All scenarios completed
+with **0 % errors**.
 
 ### Results summary
 
-| Scenario | VUs | req/s | p50 | p95 | p99 | Notes |
-|----------|-----|-------|-----|-----|-----|-------|
-| **Warm cache — Redis L2** | 1000 | **1 693** | 45 ms | 186 ms | 775 ms | PostGIS lookup → Redis RAM → HTTP |
-| **Warm cache — MinIO only** | 1000 | **930** | 92 ms | 647 ms | 2.1 s | PostGIS lookup → MinIO GET → HTTP |
-| **Cold render** | 100 | **164** | 137 ms | 685 ms | — | GDAL range-req → NDVI → PNG encode |
+| Scenario | Replicas | VUs | req/s | p50 | p95 | p99 |
+|----------|----------|-----|-------|-----|-----|-----|
+| Warm cache — Redis L2 (single tile) | 3 | 1000 | **1 693** | 45 ms | 186 ms | 775 ms |
+| Warm cache — MinIO only (single tile) | 3 | 1000 | **930** | 92 ms | 647 ms | 2.1 s |
+| Warm cache — Redis + MinIO (60 unique tiles) | 10 | 1000 | **1 855** | 39 ms | 160 ms | 480 ms |
+| Cold render — no singleflight | 3 | 100 | **164** | 137 ms | 685 ms | — |
+| Cold render — with singleflight | 10 | 100 | **455** | 52 ms | 157 ms | — |
 
-All scenarios completed with **0 % errors**.
-
-### Cache hit path (Redis L2 enabled)
+### Warm cache — 10 replicas, 60 unique tiles (Redis + MinIO)
 
 ```
-checks_succeeded...: 100.00% 1 266 615 / 1 266 615
-http_req_duration..: avg=75ms   p(50)=45ms   p(90)=135ms  p(95)=186ms  p(99)=775ms
+http_req_duration..: avg=61ms  p(50)=39.61ms  p(95)=160.71ms  p(99)=480.66ms  max=3.78s
+http_req_failed....: 0.00%   0 out of 475 846
+http_reqs..........: 475 846  1855 req/s
+data_received......: 49 GB    191 MB/s
+png_size_bytes.....: avg=99 300  min=98 774  max=99 993
+```
+
+60 unique pre-warmed tiles, random selection per VU. Redis serves hot tiles
+from RAM; cold tiles fall through to MinIO. At 191 MB/s the bottleneck is
+MinIO I/O, not CPU.
+
+### Warm cache — 3 replicas, single hot tile (Redis L2)
+
+```
+http_req_duration..: avg=75ms   p(50)=45ms   p(95)=186ms   p(99)=775ms
 http_req_failed....: 0.00%
 http_reqs..........: 422 205   1693 req/s
 data_received......: 66 GB     263 MB/s
 ```
 
-Each PNG tile is ~149 KB. Redis absorbs the read load; PostGIS only does a
-key lookup to validate freshness.
+Single tile, 100 % Redis hits. PostGIS only validates key freshness. At
+263 MB/s the bottleneck is the loopback network, not the Go service.
 
-### Cache hit path (MinIO only, Redis disabled)
+### Cold render — 10 replicas + singleflight (GDAL → NDVI → PNG)
 
 ```
-checks_succeeded...: 100.00% 692 382 / 692 382
-http_req_duration..: avg=189ms  p(50)=92ms   p(90)=359ms  p(95)=647ms  p(99)=2.1s
+http_req_duration..: avg=~100ms  p(50)=52ms  p(95)=157ms
 http_req_failed....: 0.00%
-http_reqs..........: 230 795   931 req/s
-data_received......: 36 GB     145 MB/s
+http_reqs..........: ~27 000    455 req/s
 ```
 
-Bottleneck is MinIO I/O: 930 req/s × 149 KB ≈ **138 MB/s** saturates the
-local MinIO instance.
+With singleflight, identical concurrent requests collapse into one GDAL
+pipeline per replica. At 10 replicas that is up to 10 parallel pipelines.
+Compared to the 3-replica baseline (164 req/s, p95=648ms) this is **+171 %
+throughput** and **−76 % p95 latency**.
 
-### Cold render path (GDAL → NDVI → PNG)
+### Cold render — 3 replicas, no singleflight (baseline)
 
 ```
-checks_succeeded...: 100.00% 149 037 / 149 037
-http_req_duration..: avg=225ms  p(50)=137ms  p(90)=501ms  p(95)=685ms  max=11s
+http_req_duration..: avg=225ms  p(50)=137ms  p(95)=685ms  max=11s
 http_req_failed....: 0.00%
 http_reqs..........: 49 679    164 req/s
 data_received......: 3.6 GB    12 MB/s
 ```
 
-At 100 concurrent VUs the 3 replicas together sustain 164 renders/s
-(~55 renders/s per replica). The CPU semaphore (capped at `GOMAXPROCS`) keeps
-each replica healthy; the long max latency (11 s) appears at the 100-VU peak
-when all GDAL slots are busy.
+CPU is the limiting resource: GDAL HTTP range requests + NDVI computation
++ PNG encoding compete for cores. Max latency spike (11 s) occurs at peak
+100-VU load when all GDAL semaphore slots are taken.
 
 ### Profiling (pprof)
 
@@ -438,8 +449,8 @@ Enable pprof with `PPROF_ENABLED=true` in `.env`, then while k6 is running:
 go tool pprof -http=:8888 'http://localhost:6060/debug/pprof/profile?seconds=30'
 ```
 
-CPU flame graphs show that the cold-render bottleneck is split between GDAL
-HTTP range requests to MinIO and PNG encoding; NDVI math is negligible.
+CPU flame graphs show the cold-render bottleneck is split between GDAL HTTP
+range requests to MinIO and PNG encoding; NDVI math is negligible.
 
 ---
 
