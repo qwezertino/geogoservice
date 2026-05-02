@@ -373,6 +373,76 @@ Set `STAC_PROVIDER` in `.env` to change the preferred provider. Fallback is auto
 
 ---
 
+## Performance benchmarks
+
+Load tests run on a local machine with 3 app replicas (`make loadtest-up`),
+`STAC_PROVIDER=local` (synthetic COGs pre-loaded into MinIO, no external STAC
+calls), and the k6 scripts in `loadtest/k6/`.
+
+### Results summary
+
+| Scenario | VUs | req/s | p50 | p95 | p99 | Notes |
+|----------|-----|-------|-----|-----|-----|-------|
+| **Warm cache — Redis L2** | 1000 | **1 693** | 45 ms | 186 ms | 775 ms | PostGIS lookup → Redis RAM → HTTP |
+| **Warm cache — MinIO only** | 1000 | **930** | 92 ms | 647 ms | 2.1 s | PostGIS lookup → MinIO GET → HTTP |
+| **Cold render** | 100 | **164** | 137 ms | 685 ms | — | GDAL range-req → NDVI → PNG encode |
+
+All scenarios completed with **0 % errors**.
+
+### Cache hit path (Redis L2 enabled)
+
+```
+checks_succeeded...: 100.00% 1 266 615 / 1 266 615
+http_req_duration..: avg=75ms   p(50)=45ms   p(90)=135ms  p(95)=186ms  p(99)=775ms
+http_req_failed....: 0.00%
+http_reqs..........: 422 205   1693 req/s
+data_received......: 66 GB     263 MB/s
+```
+
+Each PNG tile is ~149 KB. Redis absorbs the read load; PostGIS only does a
+key lookup to validate freshness.
+
+### Cache hit path (MinIO only, Redis disabled)
+
+```
+checks_succeeded...: 100.00% 692 382 / 692 382
+http_req_duration..: avg=189ms  p(50)=92ms   p(90)=359ms  p(95)=647ms  p(99)=2.1s
+http_req_failed....: 0.00%
+http_reqs..........: 230 795   931 req/s
+data_received......: 36 GB     145 MB/s
+```
+
+Bottleneck is MinIO I/O: 930 req/s × 149 KB ≈ **138 MB/s** saturates the
+local MinIO instance.
+
+### Cold render path (GDAL → NDVI → PNG)
+
+```
+checks_succeeded...: 100.00% 149 037 / 149 037
+http_req_duration..: avg=225ms  p(50)=137ms  p(90)=501ms  p(95)=685ms  max=11s
+http_req_failed....: 0.00%
+http_reqs..........: 49 679    164 req/s
+data_received......: 3.6 GB    12 MB/s
+```
+
+At 100 concurrent VUs the 3 replicas together sustain 164 renders/s
+(~55 renders/s per replica). The CPU semaphore (capped at `GOMAXPROCS`) keeps
+each replica healthy; the long max latency (11 s) appears at the 100-VU peak
+when all GDAL slots are busy.
+
+### Profiling (pprof)
+
+Enable pprof with `PPROF_ENABLED=true` in `.env`, then while k6 is running:
+
+```bash
+go tool pprof -http=:8888 'http://localhost:6060/debug/pprof/profile?seconds=30'
+```
+
+CPU flame graphs show that the cold-render bottleneck is split between GDAL
+HTTP range requests to MinIO and PNG encoding; NDVI math is negligible.
+
+---
+
 ## Scaling
 
 ```bash
