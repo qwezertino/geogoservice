@@ -71,9 +71,10 @@ type LookupResult struct {
 }
 
 // Lookup checks whether a tile for the given parameters already exists in the
-// cache. Returns (result, true, nil) on a hit, (nil, false, nil) on a miss,
-// or (nil, false, err) on a database error.
-func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexType string, w, h int) (*LookupResult, bool, error) {
+// cache. polygonHash is "" for plain tiles and an 8-char hex string for
+// polygon-masked tiles. Returns (result, true, nil) on a hit, (nil, false, nil)
+// on a miss, or (nil, false, err) on a database error.
+func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexType string, w, h int, polygonHash string) (*LookupResult, bool, error) {
 	const q = `
 		SELECT minio_key
 		FROM   tile_cache
@@ -85,12 +86,13 @@ func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexTyp
 		  AND  index_type     = $6
 		  AND  width          = $7
 		  AND  height         = $8
+		  AND  polygon_hash   = $9
 		LIMIT 1`
 
 	var key string
 	err := s.db.QueryRow(ctx, q,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
-		date, indexType, w, h,
+		date, indexType, w, h, polygonHash,
 	).Scan(&key)
 	if err != nil {
 		// pgx returns pgx.ErrNoRows which is not a db error
@@ -138,14 +140,15 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 }
 
 // SaveAsync uploads pngBytes to MinIO and inserts a metadata record in
-// PostgreSQL asynchronously. Errors are logged but not returned to the caller
-// so that the HTTP response is not blocked.
-func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte) {
+// PostgreSQL asynchronously. polygonHash is "" for plain tiles and an 8-char
+// hex string for polygon-masked tiles. Errors are logged but not returned to
+// the caller so that the HTTP response is not blocked.
+func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		key := BuildKey(bbox, date, indexType, w, h)
+		key := BuildKey(bbox, date, indexType, w, h, polygonHash)
 
 		_, err := s.minio.PutObject(ctx, s.bucket, key,
 			bytes.NewReader(pngBytes), int64(len(pngBytes)),
@@ -166,16 +169,16 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 		const ins = `
 			INSERT INTO tile_cache
 				(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-				 date_acquired, index_type, width, height, minio_bucket, minio_key)
+				 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash)
 			VALUES
-				(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10)
+				(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11)
 			ON CONFLICT (bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-			             date_acquired, index_type, width, height) DO NOTHING`
+			             date_acquired, index_type, width, height, polygon_hash) DO NOTHING`
 
 		_, err = s.db.Exec(ctx, ins,
 			bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 			date, indexType, w, h,
-			s.bucket, key,
+			s.bucket, key, polygonHash,
 		)
 		if err != nil {
 			fmt.Printf("[cache] db insert error key=%s: %v\n", key, err)
@@ -258,11 +261,20 @@ func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
 }
 
 // BuildKey creates a deterministic MinIO object key from the tile parameters.
+// If polygonHash is non-empty it is appended to the filename, distinguishing
+// polygon-masked tiles from the plain tile with the same bbox/date/dimensions.
 // Exported so workers can construct the result URL before SaveAsync completes.
-func BuildKey(bbox geo.BBox, date, indexType string, w, h int) string {
-	return fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d.png",
+func BuildKey(bbox geo.BBox, date, indexType string, w, h int, polygonHash string) string {
+	if polygonHash == "" {
+		return fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d.png",
+			indexType, date,
+			bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
+			w, h,
+		)
+	}
+	return fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d_%s.png",
 		indexType, date,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
-		w, h,
+		w, h, polygonHash,
 	)
 }

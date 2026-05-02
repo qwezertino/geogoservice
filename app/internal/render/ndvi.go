@@ -66,7 +66,9 @@ func ndviColorMap(v float32) color.RGBA {
 
 // RenderPNG converts an NDVI float32 buffer (row-major, width×height) into a
 // colour-mapped PNG byte slice using the project colour map.
-func RenderPNG(ndvi []float32, width, height int) ([]byte, error) {
+// If maskPoly contains at least 3 pixel-space points, pixels outside the
+// polygon are made fully transparent before encoding.
+func RenderPNG(ndvi []float32, width, height int, maskPoly [][2]float64) ([]byte, error) {
 	if len(ndvi) != width*height {
 		return nil, fmt.Errorf("ndvi buffer length %d != width*height (%d×%d=%d)",
 			len(ndvi), width, height, width*height)
@@ -80,9 +82,44 @@ func RenderPNG(ndvi []float32, width, height int) ([]byte, error) {
 		}
 	}
 
+	if len(maskPoly) >= 3 {
+		applyPolygonMask(img, maskPoly)
+	}
+
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		return nil, fmt.Errorf("encode PNG: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// applyPolygonMask sets the alpha of every pixel whose centre falls outside
+// poly (pixel-space coordinates) to zero (fully transparent).
+func applyPolygonMask(img *image.RGBA, poly [][2]float64) {
+	b := img.Bounds()
+	transparent := color.RGBA{}
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			if !pointInPolygon(float64(x)+0.5, float64(y)+0.5, poly) {
+				img.SetRGBA(x, y, transparent)
+			}
+		}
+	}
+}
+
+// pointInPolygon reports whether (px, py) is inside the polygon using the
+// ray-casting algorithm. Assumes poly has at least 3 points.
+func pointInPolygon(px, py float64, poly [][2]float64) bool {
+	n := len(poly)
+	inside := false
+	j := n - 1
+	for i := 0; i < n; i++ {
+		xi, yi := poly[i][0], poly[i][1]
+		xj, yj := poly[j][0], poly[j][1]
+		if ((yi > py) != (yj > py)) && (px < (xj-xi)*(py-yi)/(yj-yi)+xi) {
+			inside = !inside
+		}
+		j = i
+	}
+	return inside
 }

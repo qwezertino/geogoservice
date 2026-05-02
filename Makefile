@@ -1,4 +1,4 @@
-.PHONY: build up down scale tidy lint test setup ps logs
+.PHONY: build up down scale tidy lint test setup ps logs migrate
 
 ## setup: prepare data directories with correct permissions (run once after git clone)
 setup:
@@ -29,6 +29,12 @@ logs:
 ## logs: tail logs from all services
 ps:
 	docker compose ps
+
+## migrate: apply pending SQL migrations to the running PostgreSQL instance
+##   Run this once after upgrading from a version that did not have polygon support.
+migrate:
+	docker compose exec -T postgis psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} \
+		-f /docker-entrypoint-initdb.d/002_add_polygon_hash.sql
 
 ## tidy: run go mod tidy inside a temporary container (requires GDAL for CGO)
 tidy:

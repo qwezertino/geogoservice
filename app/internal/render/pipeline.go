@@ -16,6 +16,9 @@ type TileParams struct {
 	W, H             int
 	SearchWindowDays int
 	MaxCloudCover    float64
+	// Polygon is an optional WGS-84 clipping polygon ([longitude, latitude] pairs).
+	// Pixels outside the polygon are made transparent in the rendered PNG.
+	Polygon []geo.LngLat
 }
 
 // RenderTile runs the full satellite → NDVI → PNG pipeline and returns PNG bytes.
@@ -50,7 +53,12 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) ([]b
 		return nil, fmt.Errorf("compute NDVI: %w", err)
 	}
 
-	pngBytes, err := RenderPNG(ndvi, p.W, p.H)
+	var pixelPoly [][2]float64
+	if len(p.Polygon) >= 3 {
+		pixelPoly = geo.PolygonToPixels(p.Polygon, p.BBox, p.W, p.H)
+	}
+
+	pngBytes, err := RenderPNG(ndvi, p.W, p.H, pixelPoly)
 	if err != nil {
 		return nil, fmt.Errorf("encode PNG: %w", err)
 	}

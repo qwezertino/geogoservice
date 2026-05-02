@@ -91,10 +91,11 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	polygonHash := geo.PolygonHash(params.polygon)
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────
 	if !params.noCache {
-		hit, found, err := rh.store.Lookup(ctx, params.bbox3857, params.date, params.index, params.w, params.h)
+		hit, found, err := rh.store.Lookup(ctx, params.bbox3857, params.date, params.index, params.w, params.h, polygonHash)
 		if err != nil {
 			http.Error(w, "cache lookup error", http.StatusInternalServerError)
 			fmt.Printf("[handler] cache lookup: %v\n", err)
@@ -115,7 +116,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	// ── 2. Singleflight: deduplicate concurrent renders for the same tile ────────
 	// If N requests arrive for the same bbox/date/index/size simultaneously,
 	// only one GDAL render runs — all others share the result.
-	sfKey := cache.BuildKey(params.bbox3857, params.date, params.index, params.w, params.h)
+	sfKey := cache.BuildKey(params.bbox3857, params.date, params.index, params.w, params.h, polygonHash)
 	type result struct {
 		png []byte
 		err error
@@ -138,13 +139,14 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 			H:                params.h,
 			SearchWindowDays: params.searchWindowDays,
 			MaxCloudCover:    params.maxCloudCover,
+			Polygon:          params.polygon,
 		}, rh.stacClient)
 		if renderErr != nil {
 			return nil, renderErr
 		}
 
 		// Save to cache — only once, not for every waiting goroutine.
-		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, png)
+		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, png, polygonHash)
 		return result{png: png}, nil
 	})
 	if err != nil {
@@ -179,6 +181,7 @@ type renderParams struct {
 	searchWindowDays int
 	maxCloudCover    float64
 	noCache          bool // skip cache lookup and save (load-testing)
+	polygon          []geo.LngLat
 }
 
 // parseParams accepts both the modern and legacy GeoServer parameter formats.
@@ -256,6 +259,15 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 
 	noCache := q.Get("nocache") == "1" || q.Get("nocache") == "true"
 
+	var polygon []geo.LngLat
+	if polyStr := q.Get("polygon"); polyStr != "" {
+		pts, err := parsePolygon(polyStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid polygon: %w", err)
+		}
+		polygon = pts
+	}
+
 	return &renderParams{
 		bbox3857:         bbox,
 		date:             dateStr,
@@ -265,7 +277,36 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 		searchWindowDays: searchWindow,
 		maxCloudCover:    maxCloud,
 		noCache:          noCache,
+		polygon:          polygon,
 	}, nil
+}
+
+// parsePolygon parses a flat "lng1,lat1,lng2,lat2,..." string into LngLat pairs.
+// Requires at least 3 pairs (6 values).
+func parsePolygon(raw string) ([]geo.LngLat, error) {
+	parts := strings.Split(raw, ",")
+	if len(parts) < 6 || len(parts)%2 != 0 {
+		return nil, fmt.Errorf("need at least 3 lng,lat pairs (%d values given)", len(parts))
+	}
+	pts := make([]geo.LngLat, len(parts)/2)
+	for i := range pts {
+		lng, err := strconv.ParseFloat(strings.TrimSpace(parts[i*2]), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid longitude at pair %d: %q", i, parts[i*2])
+		}
+		lat, err := strconv.ParseFloat(strings.TrimSpace(parts[i*2+1]), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid latitude at pair %d: %q", i, parts[i*2+1])
+		}
+		if lng < -180 || lng > 180 {
+			return nil, fmt.Errorf("longitude %v at pair %d out of range [-180, 180]", lng, i)
+		}
+		if lat < -90 || lat > 90 {
+			return nil, fmt.Errorf("latitude %v at pair %d out of range [-90, 90]", lat, i)
+		}
+		pts[i] = geo.LngLat{lng, lat}
+	}
+	return pts, nil
 }
 
 // parseBBox parses bbox from either format:

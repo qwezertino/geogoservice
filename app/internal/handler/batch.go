@@ -25,6 +25,9 @@ type BatchRequest struct {
 	// Optional — server defaults are used when zero.
 	SearchWindowDays int     `json:"search_window_days,omitempty"`
 	MaxCloudCover    float64 `json:"max_cloud_cover,omitempty"`
+	// Polygon is an optional WGS-84 clipping polygon as [longitude, latitude] pairs.
+	// Pixels outside the polygon become transparent in the rendered PNG.
+	Polygon [][2]float64 `json:"polygon,omitempty"`
 }
 
 // BatchResult is the outcome for a single tile.
@@ -125,8 +128,14 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 		maxCloud = rh.defaultMaxCloudCover
 	}
 
+	polygon := make([]geo.LngLat, len(req.Polygon))
+	for i, pt := range req.Polygon {
+		polygon[i] = geo.LngLat{pt[0], pt[1]}
+	}
+	polygonHash := geo.PolygonHash(polygon)
+
 	// ── 1. Cache check ────────────────────────────────────────────────────────
-	hit, found, err := rh.store.Lookup(ctx, bbox, req.Date, req.Index, req.W, req.H)
+	hit, found, err := rh.store.Lookup(ctx, bbox, req.Date, req.Index, req.W, req.H, polygonHash)
 	if err == nil && found {
 		pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
 		if err == nil {
@@ -157,12 +166,13 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 		H:                req.H,
 		SearchWindowDays: searchWindow,
 		MaxCloudCover:    maxCloud,
+		Polygon:          polygon,
 	}, rh.stacClient)
 	if err != nil {
 		return BatchResult{Index: idx, Error: err.Error()}
 	}
 
-	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, pngBytes)
+	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, pngBytes, polygonHash)
 
 	return BatchResult{
 		Index: idx,
