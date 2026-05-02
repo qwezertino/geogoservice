@@ -48,12 +48,25 @@ func run() error {
 
 	mux := http.NewServeMux()
 
-	// Core tile endpoint
+	// Core tile endpoint — GET returns PNG (cache hit: fast, miss: GDAL render).
+	// Concurrent GDAL renders are capped at RenderWorkers (default = NumCPU).
 	renderHandler := handler.New(store, stacClient, handler.HandlerOptions{
 		DefaultSearchWindowDays: cfg.STACSearchWindowDays,
 		DefaultMaxCloudCover:    cfg.STACMaxCloudCover,
+		RenderWorkers:           cfg.RenderWorkers,
 	})
 	mux.Handle("/api/render", renderHandler)
+
+	// Batch tile endpoint — POST returns JSON array of base64-encoded PNGs.
+	// All tiles in the batch are rendered in parallel (shared semaphore).
+	// Client receives all results at once → displays all tiles simultaneously.
+	mux.HandleFunc("/api/render/batch", renderHandler.ServeBatch)
+
+	// Catalog endpoint — GET returns JSON list of cached NDVI tiles from PostgreSQL.
+	mux.HandleFunc("/api/catalog", renderHandler.ServeCatalog)
+
+	// Delete endpoint — DELETE removes a tile from MinIO, PostgreSQL, and Redis.
+	mux.HandleFunc("/api/tiles", renderHandler.ServeDelete)
 
 	// Health check (used by Docker Compose and Nginx)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

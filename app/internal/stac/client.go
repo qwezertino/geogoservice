@@ -21,13 +21,8 @@ const (
 	ProviderEarthSearch       = "earth-search"
 )
 
-const (
-	// Sentinel2Collection is the Sentinel-2 Level-2A collection ID used by all providers.
-	Sentinel2Collection = "sentinel-2-l2a"
-
-	defaultSearchWindowDays = 15
-	defaultMaxCloudCover    = 20.0
-)
+// Sentinel2Collection is the Sentinel-2 Level-2A collection ID used by all providers.
+const Sentinel2Collection = "sentinel-2-l2a"
 
 // BandURLs holds the ready-to-use (signed if necessary) HTTPS/S3 URLs for the
 // Red (B04) and NIR (B08) bands of a Sentinel-2 scene.
@@ -70,14 +65,12 @@ func NewClient(preferredName string, httpClient *http.Client) *Client {
 	pc := newPlanetaryComputerProvider(httpClient)
 	es := newEarthSearchProvider(httpClient)
 
-	// Default order: PC first, Earth Search as fallback.
-	// Flip when the operator explicitly prefers Earth Search.
-	ordered := []Provider{pc, es}
-	if preferredName == ProviderEarthSearch {
-		ordered = []Provider{es, pc}
+	switch preferredName {
+	case ProviderEarthSearch:
+		return &Client{providers: []Provider{es, pc}}
+	default:
+		return &Client{providers: []Provider{pc, es}}
 	}
-
-	return &Client{providers: ordered}
 }
 
 // FindBestScene tries each registered provider in order, returning the first
@@ -155,7 +148,6 @@ func doSearch(ctx context.Context, hc *http.Client, baseURL string, body stacSea
 		return nil, fmt.Errorf("build STAC request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.ContentLength = int64(len(b))
 
 	resp, err := hc.Do(req)
 	if err != nil {

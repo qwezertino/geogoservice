@@ -1,4 +1,3 @@
-// Package geo provides coordinate transformation utilities using GDAL/PROJ.
 package geo
 
 import (

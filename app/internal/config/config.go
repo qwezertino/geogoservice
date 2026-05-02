@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/qwezert/geogoservice/internal/stac"
 )
 
 // Config holds all runtime configuration for the service.
@@ -36,6 +38,15 @@ type Config struct {
 	// STACMaxCloudCover is the maximum acceptable cloud cover percentage (0–100).
 	// Default: 20.
 	STACMaxCloudCover float64
+
+	// RenderWorkers is the number of goroutines in the async render worker pool.
+	// Defaults to runtime.NumCPU() when 0.
+	RenderWorkers int
+
+	// RedisURL is the connection URL for the Redis L2 tile cache.
+	// Format: redis://[user:password@]host:port/db
+	// If empty, Redis is disabled and tiles are always fetched from MinIO.
+	RedisURL string
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -60,7 +71,7 @@ func Load() (*Config, error) {
 
 	stacProvider := os.Getenv("STAC_PROVIDER")
 	if stacProvider == "" {
-		stacProvider = "planetary-computer"
+		stacProvider = stac.ProviderPlanetaryComputer
 	}
 
 	searchWindow := 15
@@ -92,6 +103,8 @@ func Load() (*Config, error) {
 		STACProvider:         stacProvider,
 		STACSearchWindowDays: searchWindow,
 		STACMaxCloudCover:    maxCloud,
+		RedisURL:             os.Getenv("REDIS_URL"),
+		RenderWorkers:        func() int { n, _ := strconv.Atoi(os.Getenv("RENDER_WORKERS")); return n }(),
 	}, nil
 }
 

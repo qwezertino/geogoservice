@@ -1,13 +1,17 @@
-// Package handler implements the HTTP request handler for the /api/render endpoint.
+// Package handler implements HTTP handlers for the tile rendering and management endpoints.
 package handler
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/qwezert/geogoservice/internal/cache"
 	"github.com/qwezert/geogoservice/internal/geo"
@@ -30,6 +34,8 @@ import (
 type RenderHandler struct {
 	store      *cache.Store
 	stacClient *stac.Client
+	sem        chan struct{}      // limits concurrent GDAL renders
+	sf         singleflight.Group // deduplicates in-flight renders for the same tile
 
 	// Default STAC search parameters — overridable per-request via query string.
 	defaultSearchWindowDays int
@@ -40,6 +46,8 @@ type RenderHandler struct {
 type HandlerOptions struct {
 	DefaultSearchWindowDays int
 	DefaultMaxCloudCover    float64
+	// RenderWorkers caps concurrent GDAL render operations. 0 = runtime.NumCPU().
+	RenderWorkers int
 }
 
 // New creates a RenderHandler with the given dependencies.
@@ -52,23 +60,30 @@ func New(store *cache.Store, stacClient *stac.Client, opts HandlerOptions) *Rend
 	if maxCloud <= 0 {
 		maxCloud = 20.0
 	}
+	workers := opts.RenderWorkers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
 	return &RenderHandler{
 		store:                   store,
 		stacClient:              stacClient,
+		sem:                     make(chan struct{}, workers),
 		defaultSearchWindowDays: searchWindow,
 		defaultMaxCloudCover:    maxCloud,
 	}
 }
 
-// ServeHTTP handles GET /api/render requests.
-//
-// Supports two parameter formats – see package-level comment for details.
+// ServeHTTP handles GET /api/render — checks cache, then renders on cache miss.
 func (rh *RenderHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	rh.handleSync(w, r)
+}
 
+// handleSync checks cache and, on miss, renders synchronously.
+func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	params, err := parseParams(r, rh.defaultSearchWindowDays, rh.defaultMaxCloudCover)
 	if err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
@@ -78,74 +93,72 @@ func (rh *RenderHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────
-	hit, found, err := rh.store.Lookup(ctx, params.bbox3857, params.date, params.index, params.w, params.h)
-	if err != nil {
-		http.Error(w, "cache lookup error", http.StatusInternalServerError)
-		fmt.Printf("[handler] cache lookup: %v\n", err)
-		return
-	}
-	if found {
-		pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
+	if !params.noCache {
+		hit, found, err := rh.store.Lookup(ctx, params.bbox3857, params.date, params.index, params.w, params.h)
 		if err != nil {
-			// Cache inconsistency – fall through and recompute
-			fmt.Printf("[handler] minio get failed, recomputing: %v\n", err)
-		} else {
-			writePNG(w, pngBytes)
+			http.Error(w, "cache lookup error", http.StatusInternalServerError)
+			fmt.Printf("[handler] cache lookup: %v\n", err)
 			return
+		}
+		if found {
+			pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
+			if err != nil {
+				// Cache inconsistency – fall through and recompute
+				fmt.Printf("[handler] minio get failed, recomputing: %v\n", err)
+			} else {
+				writePNG(w, pngBytes)
+				return
+			}
 		}
 	}
 
-	// ── 2. Transform bbox 3857 → 4326 for STAC query ─────────────────────────
-	bbox4326, err := geo.Transform3857To4326(params.bbox3857)
+	// ── 2. Singleflight: deduplicate concurrent renders for the same tile ────────
+	// If N requests arrive for the same bbox/date/index/size simultaneously,
+	// only one GDAL render runs — all others share the result.
+	sfKey := cache.BuildKey(params.bbox3857, params.date, params.index, params.w, params.h)
+	type result struct {
+		png []byte
+		err error
+	}
+	v, err, _ := rh.sf.Do(sfKey, func() (any, error) {
+		// ── 2a. Acquire render slot inside the singleflight func ─────────────
+		select {
+		case rh.sem <- struct{}{}:
+			defer func() { <-rh.sem }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+		// ── 2b. Full render pipeline ─────────────────────────────────────────
+		png, renderErr := render.RenderTile(ctx, render.TileParams{
+			BBox:             params.bbox3857,
+			Date:             params.date,
+			Index:            params.index,
+			W:                params.w,
+			H:                params.h,
+			SearchWindowDays: params.searchWindowDays,
+			MaxCloudCover:    params.maxCloudCover,
+		}, rh.stacClient)
+		if renderErr != nil {
+			return nil, renderErr
+		}
+
+		// Save to cache — only once, not for every waiting goroutine.
+		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, png)
+		return result{png: png}, nil
+	})
 	if err != nil {
-		http.Error(w, "coordinate transform error", http.StatusInternalServerError)
-		fmt.Printf("[handler] transform: %v\n", err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "request cancelled", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "PNG render failed", http.StatusInternalServerError)
+			fmt.Printf("[handler] render: %v\n", err)
+		}
 		return
 	}
+	pngBytes := v.(result).png
 
-	// ── 3. STAC query ────────────────────────────────────────────────────────
-	bands, err := rh.stacClient.FindBestScene(ctx, bbox4326, params.date, params.searchWindowDays, params.maxCloudCover)
-	if err != nil {
-		http.Error(w, "no satellite imagery found: "+err.Error(), http.StatusNotFound)
-		fmt.Printf("[handler] STAC query: %v\n", err)
-		return
-	}
-
-	// ── 4. COG reads via GDAL /vsicurl/ (HTTP range requests) ────────────────
-	redBuf, err := geo.ReadBandWindow(bands.RedURL, bbox4326, params.w, params.h)
-	if err != nil {
-		http.Error(w, "failed to read Red band", http.StatusInternalServerError)
-		fmt.Printf("[handler] read Red: %v\n", err)
-		return
-	}
-
-	nirBuf, err := geo.ReadBandWindow(bands.NIRURL, bbox4326, params.w, params.h)
-	if err != nil {
-		http.Error(w, "failed to read NIR band", http.StatusInternalServerError)
-		fmt.Printf("[handler] read NIR: %v\n", err)
-		return
-	}
-
-	// ── 5. NDVI computation ───────────────────────────────────────────────────
-	ndvi, err := render.ComputeNDVI(redBuf, nirBuf)
-	if err != nil {
-		http.Error(w, "NDVI computation failed", http.StatusInternalServerError)
-		fmt.Printf("[handler] ndvi: %v\n", err)
-		return
-	}
-
-	// ── 6. Colour render → PNG ────────────────────────────────────────────────
-	pngBytes, err := render.RenderPNG(ndvi, params.w, params.h)
-	if err != nil {
-		http.Error(w, "PNG render failed", http.StatusInternalServerError)
-		fmt.Printf("[handler] render png: %v\n", err)
-		return
-	}
-
-	// ── 7. Async cache save ───────────────────────────────────────────────────
-	rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, pngBytes)
-
-	// ── 8. Return PNG ─────────────────────────────────────────────────────────
+	// ── 3. Return PNG ────────────────────────────────────────────────────────
 	writePNG(w, pngBytes)
 }
 
@@ -165,6 +178,7 @@ type renderParams struct {
 	w, h             int
 	searchWindowDays int
 	maxCloudCover    float64
+	noCache          bool // skip cache lookup and save (load-testing)
 }
 
 // parseParams accepts both the modern and legacy GeoServer parameter formats.
@@ -221,6 +235,7 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 	// ── STAC search overrides ─────────────────────────────────────────────────
 	// window=N   — override search window in days
 	// cloud=N    — override max cloud cover percent
+	// nocache=1  — skip cache read and write (load-testing)
 	searchWindow := defaultWindow
 	if v := q.Get("window"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -239,6 +254,8 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 		}
 	}
 
+	noCache := q.Get("nocache") == "1" || q.Get("nocache") == "true"
+
 	return &renderParams{
 		bbox3857:         bbox,
 		date:             dateStr,
@@ -247,6 +264,7 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 		h:                height,
 		searchWindowDays: searchWindow,
 		maxCloudCover:    maxCloud,
+		noCache:          noCache,
 	}, nil
 }
 

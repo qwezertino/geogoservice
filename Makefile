@@ -1,4 +1,4 @@
-.PHONY: build up down scale tidy lint test setup
+.PHONY: build up down scale tidy lint test setup ps logs
 
 ## setup: prepare data directories with correct permissions (run once after git clone)
 setup:
@@ -11,7 +11,7 @@ build:
 
 ## up: start the full stack with 3 replicas (default)
 up: setup
-	docker compose up -d --scale gogeoapp=3
+	docker compose up -d --build --scale gogeoapp=3
 
 ## scale n=N: change the number of running app replicas on-the-fly
 ##   e.g.  make scale n=5
@@ -25,6 +25,10 @@ down:
 ## logs: tail logs from all services
 logs:
 	docker compose logs -f
+
+## logs: tail logs from all services
+ps:
+	docker compose ps
 
 ## tidy: run go mod tidy inside a temporary container (requires GDAL for CGO)
 tidy:

@@ -11,6 +11,7 @@ x-app-env: &app-env
   MINIO_BUCKET: ${MINIO_BUCKET}
   MINIO_USE_SSL: "false"
   # GDAL env vars – allow /vsicurl/ to use the network
+  REDIS_URL: redis://redis:6379/0
   GDAL_HTTP_UNSAFESSL: "YES"
   CPL_VSIL_CURL_ALLOWED_EXTENSIONS: ".tif,.tiff"
   GDAL_DISABLE_READDIR_ON_OPEN: "EMPTY_DIR"
@@ -82,6 +83,19 @@ services:
       "
     restart: "no"
 
+  # ── Redis (shared L2 tile cache) ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   # ── Go service (scale with: docker compose up -d --scale gogeoapp=N) ────────
   gogeoapp:
     build: ./app
@@ -92,6 +106,8 @@ services:
       postgis:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     expose:
       - "8080"
