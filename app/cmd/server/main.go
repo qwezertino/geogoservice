@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,8 +16,12 @@ import (
 	"github.com/qwezert/geogoservice/internal/cache"
 	"github.com/qwezert/geogoservice/internal/config"
 	"github.com/qwezert/geogoservice/internal/handler"
+	"github.com/qwezert/geogoservice/internal/migrate"
 	"github.com/qwezert/geogoservice/internal/stac"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 func main() {
 	if err := run(); err != nil {
@@ -33,6 +38,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+
+	// Run database migrations before anything else.
+	// Idempotent: already-applied migrations are skipped automatically.
+	fmt.Println("[migrate] applying pending migrations...")
+	if err := migrate.Run(migrate.MigrationsFS{FS: migrationsFS, Dir: "migrations"}, cfg.MigrateDSN()); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	fmt.Println("[migrate] done")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -115,3 +115,11 @@ func (c *Config) DSN() string {
 		c.DBHost, c.DBPort, c.DBUser, c.DBPassword, c.DBName,
 	)
 }
+
+// MigrateDSN returns a URL-style DSN suitable for golang-migrate (pgx5 driver).
+func (c *Config) MigrateDSN() string {
+	return fmt.Sprintf(
+		"pgx5://%s:%s@%s:%s/%s?sslmode=disable",
+		c.DBUser, c.DBPassword, c.DBHost, c.DBPort, c.DBName,
+	)
+}
