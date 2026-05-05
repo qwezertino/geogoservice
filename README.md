@@ -282,47 +282,6 @@ curl -X DELETE "http://localhost/api/tiles?key=ndvi/2026-04-01/3430440_..._512x3
 3. Display all tiles simultaneously
 ```
 
----
-
-## Example render requests
-
-### Modern format — Berlin area, 256×256 tile
-
-```bash
-curl "http://localhost/api/render?bbox=1486000,6890000,1500000,6900000&date=2024-06-15&w=256&h=256" \
-  --output berlin_ndvi.png
-```
-
-### With polygon mask
-
-```bash
-curl "http://localhost/api/render?bbox=3430000,5872000,3432000,5874000&date=2026-04-01&w=512&h=512\
-&polygon=30.83,46.21,30.84,46.21,30.84,46.22,30.83,46.22" \
-  --output masked_ndvi.png
-```
-
-### Narrow search — only ±3 days, max 5% cloud cover
-
-```bash
-curl "http://localhost/api/render?bbox=1486000,6890000,1500000,6900000&date=2024-06-15&w=256&h=256&window=3&cloud=5" \
-  --output berlin_ndvi_clear.png
-```
-
-### Legacy GeoServer format (drop-in replacement)
-
-```bash
-curl "http://localhost/api/render?box[0]=1486000&box[1]=6890000&box[2]=1500000&box[3]=6900000&date=1718409600&width=256&height=256&indexName=ndvi" \
-  --output berlin_ndvi.png
-```
-
-> `date=1718409600` is Unix timestamp for `2024-06-15`.
-
-### How to find a bbox in EPSG:3857
-
-[bboxfinder.com](http://bboxfinder.com) — draw your area, switch projection to `EPSG:3857`, copy the coordinates.
-
----
-
 ## Colour map
 
 | NDVI value | Colour | Meaning |
