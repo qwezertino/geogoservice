@@ -15,20 +15,30 @@ import (
 	"github.com/qwezert/geogoservice/internal/geo"
 )
 
-// Provider name constants — used in the STAC_PROVIDER env variable.
+// Provider name constants — used in log output.
 const (
 	ProviderPlanetaryComputer = "planetary-computer"
 	ProviderEarthSearch       = "earth-search"
+	ProviderCDSE              = "cdse"
 )
 
 // Sentinel2Collection is the Sentinel-2 Level-2A collection ID used by all providers.
 const Sentinel2Collection = "sentinel-2-l2a"
 
-// BandURLs holds the ready-to-use (signed if necessary) HTTPS/S3 URLs for the
-// Red (B04) and NIR (B08) bands of a Sentinel-2 scene.
+// BandURLs holds the ready-to-use paths for the Red (B04) and NIR (B08) bands
+// of a Sentinel-2 scene, plus optional GDAL config options required to open them.
+//
+// RedURL and NIRURL may be plain HTTPS URLs (for public providers) or GDAL
+// virtual-filesystem paths such as /vsis3/bucket/key (for CDSE).
+//
+// GDALConfigOpts carries zero or more "KEY=VALUE" strings that are applied as
+// thread-local GDAL config options before each Open call. Public providers
+// leave this nil; CDSE sets the S3 endpoint and credentials here.
 type BandURLs struct {
-	RedURL string
-	NIRURL string
+	RedURL         string
+	NIRURL         string
+	GDALConfigOpts []string // "KEY=VALUE" pairs forwarded to GDAL, or nil
+	ProviderName   string   // name of the provider that returned these URLs
 }
 
 // Provider is the interface every STAC data source must implement.
@@ -45,16 +55,29 @@ type Provider interface {
 	FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error)
 }
 
-// Client holds an ordered list of providers and retries each one in turn,
-// returning the first successful result (automatic fallback).
+// Client tries the preferred provider first. If that fails, it races all
+// remaining providers in parallel and returns whichever answers first.
+//
+// This gives the best of both worlds: low latency on the happy path (no
+// unnecessary requests), and fast automatic recovery when the preferred
+// provider is down or slow.
 type Client struct {
-	providers []Provider
+	preferred Provider   // tried first; nil when no preference is set
+	others    []Provider // raced in parallel when preferred fails
 }
 
-// NewClient builds a Client with providers ordered so that preferredName is
-// tried first. All known providers are registered so fallback is always
-// available even if the preferred one is unavailable.
-func NewClient(preferredName string, httpClient *http.Client) *Client {
+// NewClient builds a Client with an optional preferred provider.
+//
+// preferredName controls which provider is tried first on every request.
+// Accepted values: "planetary-computer" (default), "earth-search", "cdse".
+// If the preferred provider returns an error, the remaining providers are
+// raced in parallel and the fastest successful result is returned.
+//
+// cdseS3AccessKey and cdseS3SecretKey are long-lived S3 credentials for the
+// CDSE object-storage endpoint (eodata.dataspace.copernicus.eu). Generate them
+// once at https://eodata-s3keysmanager.dataspace.copernicus.eu/. Pass empty
+// strings to disable the CDSE provider.
+func NewClient(preferredName string, httpClient *http.Client, cdseS3AccessKey, cdseS3SecretKey string) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout:   30 * time.Second,
@@ -62,29 +85,142 @@ func NewClient(preferredName string, httpClient *http.Client) *Client {
 		}
 	}
 
-	pc := newPlanetaryComputerProvider(httpClient)
-	es := newEarthSearchProvider(httpClient)
-
-	switch preferredName {
-	case ProviderEarthSearch:
-		return &Client{providers: []Provider{es, pc}}
-	default:
-		return &Client{providers: []Provider{pc, es}}
+	all := []Provider{
+		newPlanetaryComputerProvider(httpClient),
+		newEarthSearchProvider(httpClient),
 	}
+	if cdseS3AccessKey != "" && cdseS3SecretKey != "" {
+		all = append(all, newCDSEProvider(httpClient, cdseS3AccessKey, cdseS3SecretKey))
+	}
+
+	var preferred Provider
+	var others []Provider
+	for _, p := range all {
+		if p.Name() == preferredName {
+			preferred = p
+		} else {
+			others = append(others, p)
+		}
+	}
+	if preferred == nil {
+		// Requested provider not available (e.g. cdse without credentials).
+		fmt.Printf("[stac] preferred provider %q not available; will race all\n", preferredName)
+		return &Client{others: all}
+	}
+	return &Client{preferred: preferred, others: others}
 }
 
-// FindBestScene tries each registered provider in order, returning the first
-// successful result. windowDays and maxCloud are passed per-request so callers
-// can override them without rebuilding the client.
-func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
-	var lastErr error
-	for _, p := range c.providers {
-		result, err := p.FindBestScene(ctx, bbox, date, windowDays, maxCloud)
-		if err == nil {
-			return result, nil
+// FindBestSceneFallback races all non-preferred providers. Called when the
+// preferred provider returned URLs that subsequently failed at the read stage
+// (e.g. transient S3 error). The previously-used provider name is skipped so
+// we don't retry the same broken source.
+func (c *Client) FindBestSceneFallback(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64, skipProvider string) (*BandURLs, error) {
+	var pool []Provider
+	if c.preferred != nil && c.preferred.Name() != skipProvider {
+		pool = append(pool, c.preferred)
+	}
+	for _, p := range c.others {
+		if p.Name() != skipProvider {
+			pool = append(pool, p)
 		}
-		fmt.Printf("[stac] provider %q failed: %v — trying next\n", p.Name(), err)
-		lastErr = err
+	}
+	if len(pool) == 0 {
+		return nil, fmt.Errorf("no fallback providers available (skipped %q)", skipProvider)
+	}
+	if len(pool) == 1 {
+		b, err := pool[0].FindBestScene(ctx, bbox, date, windowDays, maxCloud)
+		if err == nil {
+			fmt.Printf("[stac] fallback provider %q succeeded\n", pool[0].Name())
+			b.ProviderName = pool[0].Name()
+		}
+		return b, err
+	}
+
+	type result struct {
+		bands    *BandURLs
+		err      error
+		provider string
+	}
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan result, len(pool))
+	for _, p := range pool {
+		p := p
+		go func() {
+			b, err := p.FindBestScene(raceCtx, bbox, date, windowDays, maxCloud)
+			ch <- result{bands: b, err: err, provider: p.Name()}
+		}()
+	}
+	var lastErr error
+	for range pool {
+		r := <-ch
+		if r.err == nil {
+			fmt.Printf("[stac] fallback provider %q succeeded\n", r.provider)
+			cancel()
+			r.bands.ProviderName = r.provider
+			return r.bands, nil
+		}
+		lastErr = r.err
+	}
+	return nil, fmt.Errorf("all fallback providers failed; last error: %w", lastErr)
+}
+
+// FindBestScene tries the preferred provider first. On failure it races all
+// remaining providers simultaneously and returns the fastest successful result.
+func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
+	// Fast path: preferred provider.
+	if c.preferred != nil {
+		bands, err := c.preferred.FindBestScene(ctx, bbox, date, windowDays, maxCloud)
+		if err == nil {
+			fmt.Printf("[stac] provider %q succeeded\n", c.preferred.Name())
+			bands.ProviderName = c.preferred.Name()
+			return bands, nil
+		}
+		fmt.Printf("[stac] preferred provider %q failed: %v — racing fallbacks\n", c.preferred.Name(), err)
+	}
+
+	// Fallback: race remaining providers.
+	pool := c.others
+	if len(pool) == 0 {
+		return nil, fmt.Errorf("all STAC providers failed")
+	}
+	if len(pool) == 1 {
+		bands, err := pool[0].FindBestScene(ctx, bbox, date, windowDays, maxCloud)
+		if err == nil {
+			bands.ProviderName = pool[0].Name()
+		}
+		return bands, err
+	}
+
+	type result struct {
+		bands    *BandURLs
+		err      error
+		provider string
+	}
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ch := make(chan result, len(pool))
+	for _, p := range pool {
+		p := p
+		go func() {
+			b, err := p.FindBestScene(raceCtx, bbox, date, windowDays, maxCloud)
+			ch <- result{bands: b, err: err, provider: p.Name()}
+		}()
+	}
+
+	var lastErr error
+	for range pool {
+		r := <-ch
+		if r.err == nil {
+			fmt.Printf("[stac] fallback provider %q won the race\n", r.provider)
+			cancel()
+			r.bands.ProviderName = r.provider
+			return r.bands, nil
+		}
+		fmt.Printf("[stac] provider %q failed: %v\n", r.provider, r.err)
+		lastErr = r.err
 	}
 	return nil, fmt.Errorf("all STAC providers failed; last error: %w", lastErr)
 }

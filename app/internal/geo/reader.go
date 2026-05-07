@@ -4,24 +4,41 @@ package geo
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/airbusgeo/godal"
 )
 
-// ReadBandWindow uses GDAL's /vsicurl/ virtual file system to perform HTTP
-// byte-range requests against a Cloud Optimized GeoTIFF (COG) and reads
-// only the pixels that overlap with the requested bounding box (EPSG:4326).
+// ReadBandWindow uses GDAL's virtual filesystems to read pixels from a
+// Cloud Optimized GeoTIFF or JP2 file, fetching only the bytes that overlap
+// the requested bounding box (EPSG:4326).
 //
 // Parameters:
-//   - cogURL  : HTTPS or S3 URL of the COG file (may include SAS query params).
-//   - bbox    : Desired area in EPSG:4326 degrees.
-//   - outW, outH : Desired output raster dimensions.
+//   - cogURL    : URL or GDAL virtual-filesystem path of the file. Plain HTTPS
+//     URLs are automatically wrapped with /vsicurl/. Paths already starting
+//     with /vsis (e.g. /vsis3/bucket/key for CDSE) are used as-is.
+//   - configOpts: Optional "KEY=VALUE" GDAL config strings applied as
+//     thread-local options for this Open call. Safe for concurrent use.
+//   - bbox      : Desired area in EPSG:4326 degrees.
+//   - outW, outH: Desired output raster dimensions.
 //
 // Returns a float32 slice of length outW*outH (row-major), or an error.
-func ReadBandWindow(cogURL string, bbox BBox, outW, outH int) ([]float32, error) {
-	vsicurlPath := "/vsicurl/" + cogURL
+func ReadBandWindow(cogURL string, configOpts []string, bbox BBox, outW, outH int) ([]float32, error) {
+	// Prepend /vsicurl/ only for plain HTTP(S) URLs; GDAL /vsis* paths are
+	// already rooted at a virtual filesystem.
+	vsicurlPath := cogURL
+	if strings.HasPrefix(cogURL, "http://") || strings.HasPrefix(cogURL, "https://") {
+		vsicurlPath = "/vsicurl/" + cogURL
+	}
 
-	ds, err := godal.Open(vsicurlPath)
+	var openOpts []godal.OpenOption
+	for _, opt := range configOpts {
+		// ConfigOption uses CPLSetThreadLocalConfigOption internally — safe for
+		// concurrent goroutines.
+		openOpts = append(openOpts, godal.ConfigOption(opt))
+	}
+
+	ds, err := godal.Open(vsicurlPath, openOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("open COG %q via vsicurl: %w", cogURL, err)
 	}

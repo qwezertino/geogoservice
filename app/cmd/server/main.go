@@ -57,7 +57,7 @@ func run() error {
 	}
 	defer store.Close()
 
-	stacClient := stac.NewClient(cfg.STACProvider, nil)
+	stacClient := stac.NewClient(cfg.STACProvider, nil, cfg.CDSES3AccessKey, cfg.CDSES3SecretKey)
 
 	mux := http.NewServeMux()
 

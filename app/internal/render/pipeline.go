@@ -3,6 +3,8 @@ package render
 import (
 	"context"
 	"fmt"
+	"log"
+	"time"
 
 	"github.com/qwezert/geogoservice/internal/geo"
 	"github.com/qwezert/geogoservice/internal/stac"
@@ -24,6 +26,8 @@ type TileParams struct {
 // RenderTile runs the full satellite → NDVI → PNG pipeline and returns PNG bytes.
 // It does not interact with the cache — callers are responsible for that.
 func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) ([]byte, error) {
+	t0 := time.Now()
+
 	// Transform request bbox (EPSG:3857) to WGS84 for STAC + GDAL.
 	bbox4326, err := geo.Transform3857To4326(p.BBox)
 	if err != nil {
@@ -31,23 +35,65 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) ([]b
 	}
 
 	// Find the best available satellite scene.
+	t1 := time.Now()
 	bands, err := stacClient.FindBestScene(ctx, bbox4326, p.Date, p.SearchWindowDays, p.MaxCloudCover)
 	if err != nil {
 		return nil, fmt.Errorf("find scene: %w", err)
 	}
+	log.Printf("[pipeline] stac search:  %v", time.Since(t1).Round(time.Millisecond))
 
-	// Read Red and NIR bands via GDAL /vsicurl/ (HTTP range requests).
-	redBuf, err := geo.ReadBandWindow(bands.RedURL, bbox4326, p.W, p.H)
-	if err != nil {
-		return nil, fmt.Errorf("read Red band: %w", err)
+	// readBands reads Red and NIR concurrently and returns both buffers.
+	// Returns (red, nir, error).
+	readBands := func(b *stac.BandURLs) ([]float32, []float32, time.Duration, time.Duration, error) {
+		type bandResult struct {
+			buf []float32
+			err error
+			dur time.Duration
+		}
+		redCh := make(chan bandResult, 1)
+		nirCh := make(chan bandResult, 1)
+		go func() {
+			t := time.Now()
+			buf, err := geo.ReadBandWindow(b.RedURL, b.GDALConfigOpts, bbox4326, p.W, p.H)
+			redCh <- bandResult{buf, err, time.Since(t).Round(time.Millisecond)}
+		}()
+		go func() {
+			t := time.Now()
+			buf, err := geo.ReadBandWindow(b.NIRURL, b.GDALConfigOpts, bbox4326, p.W, p.H)
+			nirCh <- bandResult{buf, err, time.Since(t).Round(time.Millisecond)}
+		}()
+		red := <-redCh
+		nir := <-nirCh
+		if red.err != nil {
+			return nil, nil, red.dur, nir.dur, fmt.Errorf("read Red band: %w", red.err)
+		}
+		if nir.err != nil {
+			return nil, nil, red.dur, nir.dur, fmt.Errorf("read NIR band: %w", nir.err)
+		}
+		return red.buf, nir.buf, red.dur, nir.dur, nil
 	}
 
-	nirBuf, err := geo.ReadBandWindow(bands.NIRURL, bbox4326, p.W, p.H)
-	if err != nil {
-		return nil, fmt.Errorf("read NIR band: %w", err)
+	// Read Red and NIR bands concurrently. On failure, retry once using a
+	// different provider (skipping the one that just gave us broken URLs).
+	t2 := time.Now()
+	redBuf, nirBuf, redDur, nirDur, readErr := readBands(bands)
+	if readErr != nil {
+		log.Printf("[pipeline] band read failed (%v provider=%q), trying fallback: %v", time.Since(t2).Round(time.Millisecond), bands.ProviderName, readErr)
+		fallback, fbErr := stacClient.FindBestSceneFallback(ctx, bbox4326, p.Date, p.SearchWindowDays, p.MaxCloudCover, bands.ProviderName)
+		if fbErr != nil {
+			return nil, fmt.Errorf("read bands failed and fallback unavailable: %w (original: %v)", fbErr, readErr)
+		}
+		t2 = time.Now()
+		redBuf, nirBuf, redDur, nirDur, readErr = readBands(fallback)
+		if readErr != nil {
+			return nil, fmt.Errorf("read bands failed on fallback provider %q: %w", fallback.ProviderName, readErr)
+		}
+		bands = fallback
 	}
+	log.Printf("[pipeline] read Red:     %v  NIR: %v  (wall: %v, provider: %s)", redDur, nirDur, time.Since(t2).Round(time.Millisecond), bands.ProviderName)
 
 	// Compute NDVI and encode as colour PNG.
+	t3 := time.Now()
 	ndvi, err := ComputeNDVI(redBuf, nirBuf)
 	if err != nil {
 		return nil, fmt.Errorf("compute NDVI: %w", err)
@@ -62,6 +108,9 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("encode PNG: %w", err)
 	}
+	log.Printf("[pipeline] ndvi+png:    %v", time.Since(t3).Round(time.Millisecond))
+
+	log.Printf("[pipeline] TOTAL:       %v  (%dx%d)", time.Since(t0).Round(time.Millisecond), p.W, p.H)
 
 	return pngBytes, nil
 }

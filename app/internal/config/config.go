@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-
-	"github.com/qwezert/geogoservice/internal/stac"
 )
 
 // Config holds all runtime configuration for the service.
@@ -25,10 +23,9 @@ type Config struct {
 	MinioBucket    string
 	MinioUseSSL    bool
 
-	// STACProvider controls which satellite data provider is used first.
-	// Accepted values: "planetary-computer" (default), "earth-search".
-	// If the preferred provider fails, the service automatically falls back
-	// to the next registered provider.
+	// STACProvider controls which satellite data provider is tried first.
+	// Accepted values: "planetary-computer" (default), "earth-search", "cdse".
+	// If the preferred provider fails, remaining providers are raced in parallel.
 	STACProvider string
 
 	// STACSearchWindowDays is the ±radius (in days) around the requested date
@@ -42,6 +39,13 @@ type Config struct {
 	// RenderWorkers is the number of goroutines in the async render worker pool.
 	// Defaults to runtime.NumCPU() when 0.
 	RenderWorkers int
+
+	// CDSES3AccessKey and CDSES3SecretKey are long-lived S3 credentials for the
+	// CDSE object-storage endpoint. Generate them at:
+	// https://eodata-s3keysmanager.dataspace.copernicus.eu/
+	// Optional: when set, CDSE joins the provider race alongside Planetary Computer and Earth Search.
+	CDSES3AccessKey string
+	CDSES3SecretKey string
 
 	// RedisURL is the connection URL for the Redis L2 tile cache.
 	// Format: redis://[user:password@]host:port/db
@@ -71,7 +75,7 @@ func Load() (*Config, error) {
 
 	stacProvider := os.Getenv("STAC_PROVIDER")
 	if stacProvider == "" {
-		stacProvider = stac.ProviderPlanetaryComputer
+		stacProvider = "planetary-computer"
 	}
 
 	searchWindow := 15
@@ -105,6 +109,8 @@ func Load() (*Config, error) {
 		STACMaxCloudCover:    maxCloud,
 		RedisURL:             os.Getenv("REDIS_URL"),
 		RenderWorkers:        func() int { n, _ := strconv.Atoi(os.Getenv("RENDER_WORKERS")); return n }(),
+		CDSES3AccessKey:      os.Getenv("CDSE_S3_ACCESS_KEY"),
+		CDSES3SecretKey:      os.Getenv("CDSE_S3_SECRET_KEY"),
 	}, nil
 }
 

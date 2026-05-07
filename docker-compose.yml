@@ -12,16 +12,29 @@ x-app-env: &app-env
   MINIO_USE_SSL: "false"
   # GDAL env vars – allow /vsicurl/ to use the network
   REDIS_URL: redis://redis:6379/0
-  GDAL_HTTP_UNSAFESSL: "YES"
-  CPL_VSIL_CURL_ALLOWED_EXTENSIONS: ".tif,.tiff"
-  GDAL_DISABLE_READDIR_ON_OPEN: "EMPTY_DIR"
+  GDAL_HTTP_UNSAFESSL: ${GDAL_HTTP_UNSAFESSL:-YES}
+  CPL_VSIL_CURL_ALLOWED_EXTENSIONS: ${CPL_VSIL_CURL_ALLOWED_EXTENSIONS:-.tif,.tiff,.jp2}
+  GDAL_HTTP_MAX_RETRY: ${GDAL_HTTP_MAX_RETRY:-3}
+  GDAL_HTTP_RETRY_DELAY: ${GDAL_HTTP_RETRY_DELAY:-1}
+  GDAL_HTTP_TIMEOUT: ${GDAL_HTTP_TIMEOUT:-5}
+  GDAL_HTTP_MERGE_CONSECUTIVE_RANGES: ${GDAL_HTTP_MERGE_CONSECUTIVE_RANGES:-YES}
+  CPL_VSIL_CURL_CHUNK_SIZE: ${CPL_VSIL_CURL_CHUNK_SIZE:-1048576}
+  GDAL_DISABLE_READDIR_ON_OPEN: ${GDAL_DISABLE_READDIR_ON_OPEN:-EMPTY_DIR}
+  CPL_VSIL_USE_TEMP_FILE_FOR_RANDOM_WRITE: ${CPL_VSIL_USE_TEMP_FILE_FOR_RANDOM_WRITE:-NO}
+  VSI_CACHE: ${VSI_CACHE:-TRUE}
+  VSI_CACHE_SIZE: ${VSI_CACHE_SIZE:-134217728}
   PORT: "8080"                  # internal container port – never changes
-  # STAC provider: "planetary-computer" (default) or "earth-search"
+  # STAC provider tried first: "planetary-computer" (default), "earth-search", "cdse"
+  # On failure the remaining providers are raced automatically.
   STAC_PROVIDER: ${STAC_PROVIDER:-planetary-computer}
   # Scene search window: ±N days around the requested date (default 15)
   STAC_SEARCH_WINDOW_DAYS: ${STAC_SEARCH_WINDOW_DAYS:-15}
   # Maximum acceptable cloud cover percent 0–100 (default 20)
   STAC_MAX_CLOUD_COVER: ${STAC_MAX_CLOUD_COVER:-20}
+  # CDSE S3 credentials — required only when STAC_PROVIDER=cdse
+  # Generate at: https://eodata-s3keysmanager.dataspace.copernicus.eu/
+  CDSE_S3_ACCESS_KEY: ${CDSE_S3_ACCESS_KEY:-}
+  CDSE_S3_SECRET_KEY: ${CDSE_S3_SECRET_KEY:-}
 
 services:
   # ── PostGIS ─────────────────────────────────────────────────────────────────

@@ -26,11 +26,13 @@ RUN go build \
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
 FROM alpine:3.21 AS runtime
 
-# gdal       = shared libraries required at runtime
-# ca-certificates = needed for HTTPS calls (STAC API, /vsicurl/)
+# gdal                   = shared libraries required at runtime
+# gdal-driver-jp2openjpeg = JPEG-2000 driver (needed for Sentinel-2 L2A assets)
+# ca-certificates         = needed for HTTPS calls (STAC API, /vsicurl/, /vsis3/)
 RUN apk add --no-cache \
         ca-certificates \
-        gdal
+        gdal \
+        gdal-driver-jp2openjpeg
 
 # Non-root user for defence-in-depth
 RUN addgroup -S appgroup && \
