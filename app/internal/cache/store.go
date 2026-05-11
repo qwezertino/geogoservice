@@ -5,6 +5,8 @@ package cache
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -258,6 +260,228 @@ func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
 	}
 
 	return nil
+}
+
+// Save uploads pngBytes to MinIO, populates Redis L2, and inserts a metadata
+// record in PostgreSQL. Unlike SaveAsync it runs synchronously and returns any
+// error — use this in background workers where you need to know whether the
+// tile was actually persisted before continuing.
+func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash string) error {
+	key := BuildKey(bbox, date, indexType, w, h, polygonHash)
+
+	_, err := s.minio.PutObject(ctx, s.bucket, key,
+		bytes.NewReader(pngBytes), int64(len(pngBytes)),
+		minio.PutObjectOptions{ContentType: "image/png"},
+	)
+	if err != nil {
+		return fmt.Errorf("minio put %q: %w", key, err)
+	}
+
+	if s.rdb != nil {
+		if err := s.rdb.Set(ctx, key, pngBytes, redisTTL).Err(); err != nil {
+			fmt.Printf("[cache] redis set error key=%s: %v\n", key, err)
+		}
+	}
+
+	const ins = `
+		INSERT INTO tile_cache
+			(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
+			 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash)
+		VALUES
+			(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11)
+		ON CONFLICT (bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
+		             date_acquired, index_type, width, height, polygon_hash) DO NOTHING`
+
+	_, err = s.db.Exec(ctx, ins,
+		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
+		date, indexType, w, h,
+		s.bucket, key, polygonHash,
+	)
+	if err != nil {
+		return fmt.Errorf("db insert tile %q: %w", key, err)
+	}
+	return nil
+}
+
+// ── Render jobs ───────────────────────────────────────────────────────────────
+
+// ErrNotFound is returned by GetJob when no job with the given ID exists.
+var ErrNotFound = errors.New("not found")
+
+// Job is an asynchronous range-render job.
+type Job struct {
+	ID        string
+	Status    string // pending / running / done / failed
+	Done      int
+	Total     int
+	Errors    []string
+	CreatedAt time.Time
+}
+
+// CreateJob inserts a new pending job and returns its UUID.
+func (s *Store) CreateJob(
+	ctx context.Context,
+	id string,
+	bbox geo.BBox,
+	startDate, endDate string,
+	maxCloud float64,
+	w, h int,
+	polygonHash string,
+	polygon [][2]float64,
+) error {
+	polyJSON, err := json.Marshal(polygon)
+	if err != nil {
+		return fmt.Errorf("marshal polygon: %w", err)
+	}
+	const q = `
+		INSERT INTO render_jobs
+			(id, bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
+			 start_date, end_date, max_cloud, w, h, polygon_hash, polygon)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+	_, err = s.db.Exec(ctx, q,
+		id,
+		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
+		startDate, endDate, maxCloud, w, h,
+		polygonHash, string(polyJSON),
+	)
+	return err
+}
+
+// SetJobRunning transitions a job to "running" and records how many scenes were found.
+func (s *Store) SetJobRunning(ctx context.Context, id string, total int) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE render_jobs SET status='running', total=$2 WHERE id=$1`, id, total)
+	return err
+}
+
+// IncrJobDone atomically increments the done counter. Safe to call from
+// multiple goroutines concurrently — the UPDATE is atomic in PostgreSQL.
+func (s *Store) IncrJobDone(ctx context.Context, id string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE render_jobs SET done=done+1 WHERE id=$1`, id)
+	return err
+}
+
+// AppendJobError appends an error message to the job's errors array.
+func (s *Store) AppendJobError(ctx context.Context, id, msg string) error {
+	errJSON, _ := json.Marshal(msg)
+	_, err := s.db.Exec(ctx,
+		`UPDATE render_jobs SET errors=errors || $2::jsonb WHERE id=$1`, id, string(errJSON))
+	return err
+}
+
+// SetJobDone marks the job as successfully completed.
+func (s *Store) SetJobDone(ctx context.Context, id string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE render_jobs SET status='done' WHERE id=$1`, id)
+	return err
+}
+
+// SetJobFailed marks the job as failed and records the reason.
+func (s *Store) SetJobFailed(ctx context.Context, id, reason string) error {
+	errJSON, _ := json.Marshal(reason)
+	_, err := s.db.Exec(ctx,
+		`UPDATE render_jobs SET status='failed', errors=errors || $2::jsonb WHERE id=$1`,
+		id, string(errJSON))
+	return err
+}
+
+// GetJob fetches a job by ID. Returns ErrNotFound if no such job exists.
+func (s *Store) GetJob(ctx context.Context, id string) (*Job, error) {
+	const q = `
+		SELECT id, status, done, total, errors, created_at
+		FROM render_jobs WHERE id=$1`
+
+	var job Job
+	var errorsJSON []byte
+	err := s.db.QueryRow(ctx, q, id).Scan(
+		&job.ID, &job.Status, &job.Done, &job.Total, &errorsJSON, &job.CreatedAt,
+	)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get job %s: %w", id, err)
+	}
+	if len(errorsJSON) > 2 { // "[]" is 2 bytes
+		_ = json.Unmarshal(errorsJSON, &job.Errors)
+	}
+	return &job, nil
+}
+
+// JobParams holds the parameters needed to query results for a job.
+type JobParams struct {
+	BBox        geo.BBox
+	StartDate   string
+	EndDate     string
+	W           int
+	H           int
+	PolygonHash string
+}
+
+// GetJobParams returns the stored parameters for a job (bbox, dates, dimensions).
+// Used by the results endpoint to query tile_cache without the caller needing
+// to know the job schema.
+func (s *Store) GetJobParams(ctx context.Context, id string) (*JobParams, error) {
+	const q = `
+		SELECT bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
+		       start_date::text, end_date::text, w, h, polygon_hash
+		FROM render_jobs WHERE id=$1`
+
+	var p JobParams
+	err := s.db.QueryRow(ctx, q, id).Scan(
+		&p.BBox.MinX, &p.BBox.MinY, &p.BBox.MaxX, &p.BBox.MaxY,
+		&p.StartDate, &p.EndDate, &p.W, &p.H, &p.PolygonHash,
+	)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get job params %s: %w", id, err)
+	}
+	return &p, nil
+}
+
+// JobTile is a single rendered scene belonging to a range job.
+type JobTile struct {
+	Date     string `json:"date"`
+	MinioKey string `json:"minio_key"`
+}
+
+// ListJobTiles returns all tile_cache rows that match the job's exact bbox,
+// dimensions, polygon_hash, and fall within [startDate, endDate].
+// These are exactly the tiles written by runRangeJob.
+func (s *Store) ListJobTiles(ctx context.Context, p *JobParams) ([]JobTile, error) {
+	const q = `
+		SELECT date_acquired::text, minio_key
+		FROM   tile_cache
+		WHERE  bbox_3857_minx = $1 AND bbox_3857_miny = $2
+		  AND  bbox_3857_maxx = $3 AND bbox_3857_maxy = $4
+		  AND  width = $5 AND height = $6
+		  AND  polygon_hash = $7
+		  AND  index_type = 'ndvi'
+		  AND  date_acquired BETWEEN $8::date AND $9::date
+		ORDER  BY date_acquired`
+
+	rows, err := s.db.Query(ctx, q,
+		p.BBox.MinX, p.BBox.MinY, p.BBox.MaxX, p.BBox.MaxY,
+		p.W, p.H, p.PolygonHash,
+		p.StartDate, p.EndDate,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list job tiles: %w", err)
+	}
+	defer rows.Close()
+
+	tiles := make([]JobTile, 0)
+	for rows.Next() {
+		var t JobTile
+		if err := rows.Scan(&t.Date, &t.MinioKey); err != nil {
+			return nil, fmt.Errorf("scan job tile: %w", err)
+		}
+		tiles = append(tiles, t)
+	}
+	return tiles, rows.Err()
 }
 
 // BuildKey creates a deterministic MinIO object key from the tile parameters.

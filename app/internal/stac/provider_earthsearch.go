@@ -60,3 +60,17 @@ func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, 
 		NIRURL: nir.Href,
 	}, nil
 }
+
+// FindScenesInRange returns one SceneInfo per unique acquisition date in
+// [startDate, endDate]. A single STAC /search is issued for the whole range.
+func (p *earthSearchProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
+	return findScenesInRangeHelper(ctx, p.hc, esBaseURL, bbox, startDate, endDate, maxCloud,
+		func(_ context.Context, f stacRawFeature) (*BandURLs, error) {
+			red := f.Assets["red"]
+			nir := f.Assets["nir"]
+			if red == nil || nir == nil {
+				return nil, fmt.Errorf("missing red or nir assets")
+			}
+			return &BandURLs{RedURL: red.Href, NIRURL: nir.Href}, nil
+		})
+}

@@ -78,6 +78,27 @@ func (p *planetaryComputerProvider) FindBestScene(ctx context.Context, bbox geo.
 	}, nil
 }
 
+// FindScenesInRange returns one SceneInfo per unique acquisition date in
+// [startDate, endDate]. A single STAC /search is issued for the whole range.
+func (p *planetaryComputerProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
+	return findScenesInRangeHelper(ctx, p.hc, pcBaseURL, bbox, startDate, endDate, maxCloud,
+		func(ctx context.Context, f stacRawFeature) (*BandURLs, error) {
+			b04 := f.Assets["B04"]
+			b08 := f.Assets["B08"]
+			if b04 == nil || b08 == nil {
+				return nil, fmt.Errorf("missing B04 or B08 assets")
+			}
+			token, err := p.getToken(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("fetch SAS token: %w", err)
+			}
+			return &BandURLs{
+				RedURL: applyToken(b04.Href, token),
+				NIRURL: applyToken(b08.Href, token),
+			}, nil
+		})
+}
+
 // getToken returns a valid SAS token, refreshing from PC when expired.
 func (p *planetaryComputerProvider) getToken(ctx context.Context) (string, error) {
 	p.tokenMu.Lock()

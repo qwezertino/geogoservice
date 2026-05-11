@@ -114,3 +114,61 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) ([]b
 
 	return pngBytes, nil
 }
+
+// RenderFromBands renders Red+NIR → NDVI → PNG from pre-fetched band URLs.
+// Use this when FindAllScenes has already resolved the scene — it skips the
+// STAC search step and goes straight to band reading.
+func RenderFromBands(ctx context.Context, bands *stac.BandURLs, p TileParams) ([]byte, error) {
+	t0 := time.Now()
+
+	bbox4326, err := geo.Transform3857To4326(p.BBox)
+	if err != nil {
+		return nil, fmt.Errorf("transform bbox: %w", err)
+	}
+
+	type bandResult struct {
+		buf []float32
+		err error
+		dur time.Duration
+	}
+	redCh := make(chan bandResult, 1)
+	nirCh := make(chan bandResult, 1)
+
+	go func() {
+		t := time.Now()
+		buf, err := geo.ReadBandWindow(bands.RedURL, bands.GDALConfigOpts, bbox4326, p.W, p.H)
+		redCh <- bandResult{buf, err, time.Since(t).Round(time.Millisecond)}
+	}()
+	go func() {
+		t := time.Now()
+		buf, err := geo.ReadBandWindow(bands.NIRURL, bands.GDALConfigOpts, bbox4326, p.W, p.H)
+		nirCh <- bandResult{buf, err, time.Since(t).Round(time.Millisecond)}
+	}()
+
+	red := <-redCh
+	nir := <-nirCh
+	if red.err != nil {
+		return nil, fmt.Errorf("read Red band: %w", red.err)
+	}
+	if nir.err != nil {
+		return nil, fmt.Errorf("read NIR band: %w", nir.err)
+	}
+	log.Printf("[pipeline] RenderFromBands %s: Red %v NIR %v provider=%s total=%v",
+		p.Date, red.dur, nir.dur, bands.ProviderName, time.Since(t0).Round(time.Millisecond))
+
+	ndvi, err := ComputeNDVI(red.buf, nir.buf)
+	if err != nil {
+		return nil, fmt.Errorf("compute NDVI: %w", err)
+	}
+
+	var pixelPoly [][2]float64
+	if len(p.Polygon) >= 3 {
+		pixelPoly = geo.PolygonToPixels(p.Polygon, p.BBox, p.W, p.H)
+	}
+
+	pngBytes, err := RenderPNG(ndvi, p.W, p.H, pixelPoly)
+	if err != nil {
+		return nil, fmt.Errorf("encode PNG: %w", err)
+	}
+	return pngBytes, nil
+}

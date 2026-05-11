@@ -81,6 +81,12 @@ func run() error {
 	// Delete endpoint — DELETE removes a tile from MinIO, PostgreSQL, and Redis.
 	mux.HandleFunc("/api/tiles", renderHandler.ServeDelete)
 
+	// Range render jobs — renders all available scenes for a bbox+date range.
+	// POST creates a job and returns immediately; GET polls progress by job ID.
+	mux.HandleFunc("POST /api/jobs/render-range", renderHandler.ServeCreateRangeJob)
+	mux.HandleFunc("GET /api/jobs/render-range/{id}", renderHandler.ServeRangeJobStatus)
+	mux.HandleFunc("GET /api/jobs/render-range/{id}/results", renderHandler.ServeRangeJobResults)
+
 	// Health check (used by Docker Compose and Nginx)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")

@@ -91,6 +91,32 @@ func (p *cdseProvider) FindBestScene(
 	}, nil
 }
 
+// FindScenesInRange returns one SceneInfo per unique acquisition date in
+// [startDate, endDate]. A single STAC /search is issued for the whole range.
+func (p *cdseProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
+	opts := []string{
+		"AWS_S3_ENDPOINT=" + cdseS3Endpoint,
+		"AWS_ACCESS_KEY_ID=" + p.s3AccessKey,
+		"AWS_SECRET_ACCESS_KEY=" + p.s3SecretKey,
+		"AWS_VIRTUAL_HOSTING=FALSE",
+		"AWS_DEFAULT_REGION=" + cdseDefaultRegion,
+		"AWS_HTTPS=YES",
+	}
+	return findScenesInRangeHelper(ctx, p.hc, cdseSTACBaseURL, bbox, startDate, endDate, maxCloud,
+		func(_ context.Context, f stacRawFeature) (*BandURLs, error) {
+			b04 := f.Assets["B04_10m"]
+			b08 := f.Assets["B08_10m"]
+			if b04 == nil || b08 == nil {
+				return nil, fmt.Errorf("missing B04_10m or B08_10m assets")
+			}
+			return &BandURLs{
+				RedURL:         s3ToVSIS3(b04.Href),
+				NIRURL:         s3ToVSIS3(b08.Href),
+				GDALConfigOpts: opts,
+			}, nil
+		})
+}
+
 // s3ToVSIS3 converts a CDSE S3 URI to a GDAL /vsis3/ path.
 //
 //	s3://eodata/Sentinel-2/...  →  /vsis3/eodata/Sentinel-2/...

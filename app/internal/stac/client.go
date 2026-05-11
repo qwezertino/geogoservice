@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/qwezert/geogoservice/internal/geo"
@@ -41,10 +42,17 @@ type BandURLs struct {
 	ProviderName   string   // name of the provider that returned these URLs
 }
 
+// SceneInfo is a single satellite scene returned by FindAllScenes.
+type SceneInfo struct {
+	Date       string // YYYY-MM-DD (UTC acquisition date)
+	CloudCover float64
+	Bands      *BandURLs
+}
+
 // Provider is the interface every STAC data source must implement.
 // To add a new provider:
 //  1. Create internal/stac/provider_<name>.go
-//  2. Implement Name() and FindBestScene()
+//  2. Implement Name(), FindBestScene(), and FindScenesInRange()
 //  3. Instantiate and add it to the ordered slice in NewClient
 type Provider interface {
 	// Name returns the human-readable identifier used in logs.
@@ -53,6 +61,10 @@ type Provider interface {
 	// that intersects bbox (EPSG:4326) within ±windowDays of date,
 	// filtered to scenes with cloud cover below maxCloud.
 	FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error)
+	// FindScenesInRange returns one SceneInfo per unique acquisition date in
+	// [startDate, endDate], picking the least-cloudy scene per date.
+	// A single STAC /search request is issued — no per-date round trips.
+	FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error)
 }
 
 // Client tries the preferred provider first. If that fails, it races all
@@ -225,6 +237,32 @@ func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, 
 	return nil, fmt.Errorf("all STAC providers failed; last error: %w", lastErr)
 }
 
+// FindAllScenes issues a single STAC search across the full date range and
+// returns one SceneInfo per unique acquisition date (least-cloudy scene wins
+// when multiple scenes exist for the same date). The preferred provider is
+// tried first; on failure the others are tried in order.
+func (c *Client) FindAllScenes(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
+	providers := make([]Provider, 0)
+	if c.preferred != nil {
+		providers = append(providers, c.preferred)
+	}
+	providers = append(providers, c.others...)
+
+	for _, p := range providers {
+		scenes, err := p.FindScenesInRange(ctx, bbox, startDate, endDate, maxCloud)
+		if err != nil {
+			fmt.Printf("[stac] FindAllScenes: provider %q failed: %v\n", p.Name(), err)
+			continue
+		}
+		for i := range scenes {
+			scenes[i].Bands.ProviderName = p.Name()
+		}
+		fmt.Printf("[stac] FindAllScenes: provider %q returned %d scenes\n", p.Name(), len(scenes))
+		return scenes, nil
+	}
+	return nil, fmt.Errorf("all providers failed for FindAllScenes %s/%s", startDate, endDate)
+}
+
 // ── Shared STAC search helpers ────────────────────────────────────────────────
 
 // stacSearchRequest is the JSON body sent to any OGC/STAC /search endpoint.
@@ -250,7 +288,11 @@ type stacSearchResponse struct {
 // stacRawFeature uses a generic asset map so each provider can look up its own
 // asset keys (e.g. "B04"/"B08" for PC vs "red"/"nir" for Earth Search).
 type stacRawFeature struct {
-	Assets map[string]*stacAsset `json:"assets"`
+	Assets     map[string]*stacAsset `json:"assets"`
+	Properties struct {
+		Datetime   string  `json:"datetime"`
+		CloudCover float64 `json:"eo:cloud_cover"`
+	} `json:"properties"`
 }
 
 type stacAsset struct {
@@ -268,6 +310,93 @@ func buildDatetimeInterval(date string, windowDays int) (string, error) {
 	to := d.AddDate(0, 0, windowDays)
 	return fmt.Sprintf("%sT00:00:00Z/%sT23:59:59Z",
 		from.Format(time.DateOnly), to.Format(time.DateOnly)), nil
+}
+
+// buildDatetimeRange returns the STAC datetime range string for [startDate, endDate].
+func buildDatetimeRange(startDate, endDate string) (string, error) {
+	if _, err := time.Parse(time.DateOnly, startDate); err != nil {
+		return "", fmt.Errorf("invalid start_date %q: %w", startDate, err)
+	}
+	if _, err := time.Parse(time.DateOnly, endDate); err != nil {
+		return "", fmt.Errorf("invalid end_date %q: %w", endDate, err)
+	}
+	return fmt.Sprintf("%sT00:00:00Z/%sT23:59:59Z", startDate, endDate), nil
+}
+
+// findScenesInRangeHelper executes a single STAC /search for the full date range,
+// groups results by acquisition date, picks the least-cloudy scene per date,
+// and applies extractFn to produce BandURLs. Result is sorted by date ascending.
+// extractFn receives a context so token-based providers (PC) can refresh lazily.
+func findScenesInRangeHelper(
+	ctx context.Context,
+	hc *http.Client,
+	baseURL string,
+	bbox geo.BBox,
+	startDate, endDate string,
+	maxCloud float64,
+	extractFn func(context.Context, stacRawFeature) (*BandURLs, error),
+) ([]SceneInfo, error) {
+	datetime, err := buildDatetimeRange(startDate, endDate)
+	if err != nil {
+		return nil, err
+	}
+
+	// One request for all scenes in the range. Sentinel-2 revisit = 5 days,
+	// so 3 months ≈ 18 dates × ~4 tiles per bbox = ~72 features max. 100 is safe.
+	features, err := doSearch(ctx, hc, baseURL, stacSearchRequest{
+		Collections: []string{Sentinel2Collection},
+		Datetime:    datetime,
+		BBox:        [4]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY},
+		Query: map[string]interface{}{
+			"eo:cloud_cover": map[string]interface{}{"lt": maxCloud},
+		},
+		SortBy: []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
+		Limit:  100,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Group by date: keep the feature with lowest cloud_cover per day.
+	type bestFeature struct {
+		f  stacRawFeature
+		cc float64
+	}
+	byDate := make(map[string]bestFeature, len(features))
+	for _, f := range features {
+		dt := f.Properties.Datetime
+		if len(dt) < 10 {
+			continue
+		}
+		date := dt[:10]
+		cc := f.Properties.CloudCover
+		if existing, ok := byDate[date]; !ok || cc < existing.cc {
+			byDate[date] = bestFeature{f: f, cc: cc}
+		}
+	}
+
+	// Sort dates for deterministic output.
+	dates := make([]string, 0, len(byDate))
+	for d := range byDate {
+		dates = append(dates, d)
+	}
+	sort.Strings(dates)
+
+	scenes := make([]SceneInfo, 0, len(dates))
+	for _, d := range dates {
+		b := byDate[d]
+		bands, err := extractFn(ctx, b.f)
+		if err != nil {
+			fmt.Printf("[stac] findScenesInRange: skip %s — extract failed: %v\n", d, err)
+			continue
+		}
+		scenes = append(scenes, SceneInfo{Date: d, CloudCover: b.cc, Bands: bands})
+	}
+
+	if len(scenes) == 0 {
+		return nil, fmt.Errorf("no usable scenes in %s/%s (cloud<%.0f%%)", startDate, endDate, maxCloud)
+	}
+	return scenes, nil
 }
 
 // doSearch executes a STAC POST /search request against baseURL and returns
