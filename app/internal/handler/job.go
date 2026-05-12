@@ -245,25 +245,44 @@ func (rh *RenderHandler) runRangeJob(
 		go func() {
 			defer func() { <-rh.sem; wg.Done() }()
 
-			params := render.TileParams{
-				BBox:    bbox,
-				Date:    scene.Date,
-				Index:   "ndvi",
-				W:       w,
-				H:       h,
-				Polygon: polygon,
-			}
-
-			pngBytes, renderErr := render.RenderFromBands(ctx, scene.Bands, params)
-			if renderErr != nil {
-				msg := fmt.Sprintf("%s: %v", scene.Date, renderErr)
-				log.Printf("[job] %s: render failed: %s", jobID, msg)
-				_ = rh.store.AppendJobError(ctx, jobID, msg)
-			} else {
-				if saveErr := rh.store.Save(ctx, bbox, scene.Date, "ndvi", w, h, pngBytes, polygonHash); saveErr != nil {
-					msg := fmt.Sprintf("%s: save: %v", scene.Date, saveErr)
+			// ── AOI cloud check via SCL band ─────────────────────────────────
+			// The global eo:cloud_cover metadata describes the whole ~12 000 km²
+			// Sentinel-2 tile, not the specific field. Read the SCL band at low
+			// resolution over the AOI to get a local cloud fraction.
+			skip := false
+			if scene.Bands.SCLURL != "" {
+				fraction, sclErr := geo.AOICloudFraction(scene.Bands.SCLURL, scene.Bands.GDALConfigOpts, bbox4326)
+				if sclErr != nil {
+					log.Printf("[job] %s: %s: SCL read failed (%v), rendering anyway", jobID, scene.Date, sclErr)
+				} else if fraction*100 > maxCloud {
+					msg := fmt.Sprintf("skip %s: AOI cloud %.0f%% exceeds threshold %.0f%%", scene.Date, fraction*100, maxCloud)
 					log.Printf("[job] %s: %s", jobID, msg)
 					_ = rh.store.AppendJobError(ctx, jobID, msg)
+					skip = true
+				}
+			}
+
+			if !skip {
+				params := render.TileParams{
+					BBox:    bbox,
+					Date:    scene.Date,
+					Index:   "ndvi",
+					W:       w,
+					H:       h,
+					Polygon: polygon,
+				}
+
+				pngBytes, renderErr := render.RenderFromBands(ctx, scene.Bands, params)
+				if renderErr != nil {
+					msg := fmt.Sprintf("%s: %v", scene.Date, renderErr)
+					log.Printf("[job] %s: render failed: %s", jobID, msg)
+					_ = rh.store.AppendJobError(ctx, jobID, msg)
+				} else {
+					if saveErr := rh.store.Save(ctx, bbox, scene.Date, "ndvi", w, h, pngBytes, polygonHash); saveErr != nil {
+						msg := fmt.Sprintf("%s: save: %v", scene.Date, saveErr)
+						log.Printf("[job] %s: %s", jobID, msg)
+						_ = rh.store.AppendJobError(ctx, jobID, msg)
+					}
 				}
 			}
 

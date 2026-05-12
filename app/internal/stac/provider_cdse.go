@@ -84,11 +84,15 @@ func (p *cdseProvider) FindBestScene(
 		"AWS_HTTPS=YES",
 	}
 
-	return &BandURLs{
+	bu := &BandURLs{
 		RedURL:         s3ToVSIS3(b04.Href),
 		NIRURL:         s3ToVSIS3(b08.Href),
 		GDALConfigOpts: opts,
-	}, nil
+	}
+	if scl := best.Assets["SCL_20m"]; scl != nil {
+		bu.SCLURL = s3ToVSIS3(scl.Href)
+	}
+	return bu, nil
 }
 
 // FindScenesInRange returns one SceneInfo per unique acquisition date in
@@ -109,11 +113,15 @@ func (p *cdseProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, sta
 			if b04 == nil || b08 == nil {
 				return nil, fmt.Errorf("missing B04_10m or B08_10m assets")
 			}
-			return &BandURLs{
+			bu := &BandURLs{
 				RedURL:         s3ToVSIS3(b04.Href),
 				NIRURL:         s3ToVSIS3(b08.Href),
 				GDALConfigOpts: opts,
-			}, nil
+			}
+			if scl := f.Assets["SCL_20m"]; scl != nil {
+				bu.SCLURL = s3ToVSIS3(scl.Href)
+			}
+			return bu, nil
 		})
 }
 

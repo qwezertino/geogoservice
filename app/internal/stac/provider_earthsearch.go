@@ -55,10 +55,14 @@ func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, 
 	}
 
 	// Earth Search COGs are on public S3 — no signing needed.
-	return &BandURLs{
+	bu := &BandURLs{
 		RedURL: red.Href,
 		NIRURL: nir.Href,
-	}, nil
+	}
+	if scl := best.Assets["scl"]; scl != nil {
+		bu.SCLURL = scl.Href
+	}
+	return bu, nil
 }
 
 // FindScenesInRange returns one SceneInfo per unique acquisition date in
@@ -71,6 +75,10 @@ func (p *earthSearchProvider) FindScenesInRange(ctx context.Context, bbox geo.BB
 			if red == nil || nir == nil {
 				return nil, fmt.Errorf("missing red or nir assets")
 			}
-			return &BandURLs{RedURL: red.Href, NIRURL: nir.Href}, nil
+			bu := &BandURLs{RedURL: red.Href, NIRURL: nir.Href}
+			if scl := f.Assets["scl"]; scl != nil {
+				bu.SCLURL = scl.Href
+			}
+			return bu, nil
 		})
 }

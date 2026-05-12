@@ -72,10 +72,14 @@ func (p *planetaryComputerProvider) FindBestScene(ctx context.Context, bbox geo.
 		return nil, fmt.Errorf("planetary computer: fetch SAS token: %w", err)
 	}
 
-	return &BandURLs{
+	bu := &BandURLs{
 		RedURL: applyToken(b04.Href, token),
 		NIRURL: applyToken(b08.Href, token),
-	}, nil
+	}
+	if scl := best.Assets["SCL"]; scl != nil {
+		bu.SCLURL = applyToken(scl.Href, token)
+	}
+	return bu, nil
 }
 
 // FindScenesInRange returns one SceneInfo per unique acquisition date in
@@ -92,10 +96,14 @@ func (p *planetaryComputerProvider) FindScenesInRange(ctx context.Context, bbox 
 			if err != nil {
 				return nil, fmt.Errorf("fetch SAS token: %w", err)
 			}
-			return &BandURLs{
+			bu := &BandURLs{
 				RedURL: applyToken(b04.Href, token),
 				NIRURL: applyToken(b08.Href, token),
-			}, nil
+			}
+			if scl := f.Assets["SCL"]; scl != nil {
+				bu.SCLURL = applyToken(scl.Href, token)
+			}
+			return bu, nil
 		})
 }
 
