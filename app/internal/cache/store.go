@@ -18,7 +18,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const redisTTL = time.Hour
+const (
+	redisTTL    = time.Hour      // live render tiles — evict quickly, saves RAM
+	redisJobTTL = 24 * time.Hour // job-rendered tiles — hot data, keep longer
+)
 
 // Store wraps the PostgreSQL connection pool, MinIO client, and Redis client.
 type Store struct {
@@ -278,7 +281,7 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 	}
 
 	if s.rdb != nil {
-		if err := s.rdb.Set(ctx, key, pngBytes, redisTTL).Err(); err != nil {
+		if err := s.rdb.Set(ctx, key, pngBytes, redisJobTTL).Err(); err != nil {
 			fmt.Printf("[cache] redis set error key=%s: %v\n", key, err)
 		}
 	}
