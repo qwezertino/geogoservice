@@ -115,10 +115,18 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) ([]b
 	return pngBytes, nil
 }
 
+// RenderResult holds both the colour-mapped PNG and the raw NDVI float32 buffer
+// produced by RenderFromBands. The raw buffer is stored as a companion object in
+// MinIO so that clients can do pixel-level NDVI lookups without re-rendering.
+type RenderResult struct {
+	PNG     []byte    // colour-mapped PNG (40–60 KB)
+	NDVIRaw []float32 // row-major float32 NDVI values, length = W×H
+}
+
 // RenderFromBands renders Red+NIR → NDVI → PNG from pre-fetched band URLs.
 // Use this when FindAllScenes has already resolved the scene — it skips the
 // STAC search step and goes straight to band reading.
-func RenderFromBands(ctx context.Context, bands *stac.BandURLs, p TileParams) ([]byte, error) {
+func RenderFromBands(ctx context.Context, bands *stac.BandURLs, p TileParams) (*RenderResult, error) {
 	t0 := time.Now()
 
 	bbox4326, err := geo.Transform3857To4326(p.BBox)
@@ -170,5 +178,5 @@ func RenderFromBands(ctx context.Context, bands *stac.BandURLs, p TileParams) ([
 	if err != nil {
 		return nil, fmt.Errorf("encode PNG: %w", err)
 	}
-	return pngBytes, nil
+	return &RenderResult{PNG: pngBytes, NDVIRaw: ndvi}, nil
 }

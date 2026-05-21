@@ -75,6 +75,10 @@ func run() error {
 	// Client receives all results at once → displays all tiles simultaneously.
 	mux.HandleFunc("/api/render/batch", renderHandler.ServeBatch)
 
+	// Raw NDVI float32 data for pixel-level hover values on the frontend.
+	// GET /api/ndvi-raw?key=<minio_key> → little-endian float32 array (W×H)
+	mux.HandleFunc("GET /api/ndvi-raw", renderHandler.ServeNDVIRaw)
+
 	// Catalog endpoint — GET returns JSON list of cached NDVI tiles from PostgreSQL.
 	mux.HandleFunc("/api/catalog", renderHandler.ServeCatalog)
 

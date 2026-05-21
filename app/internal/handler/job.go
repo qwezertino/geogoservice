@@ -272,13 +272,13 @@ func (rh *RenderHandler) runRangeJob(
 					Polygon: polygon,
 				}
 
-				pngBytes, renderErr := render.RenderFromBands(ctx, scene.Bands, params)
+				result, renderErr := render.RenderFromBands(ctx, scene.Bands, params)
 				if renderErr != nil {
 					msg := fmt.Sprintf("%s: %v", scene.Date, renderErr)
 					log.Printf("[job] %s: render failed: %s", jobID, msg)
 					_ = rh.store.AppendJobError(ctx, jobID, msg)
 				} else {
-					if saveErr := rh.store.Save(ctx, bbox, scene.Date, "ndvi", w, h, pngBytes, polygonHash); saveErr != nil {
+					if saveErr := rh.store.Save(ctx, bbox, scene.Date, "ndvi", w, h, result.PNG, result.NDVIRaw, polygonHash); saveErr != nil {
 						msg := fmt.Sprintf("%s: save: %v", scene.Date, saveErr)
 						log.Printf("[job] %s: %s", jobID, msg)
 						_ = rh.store.AppendJobError(ctx, jobID, msg)

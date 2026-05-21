@@ -5,9 +5,11 @@ package cache
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -269,7 +271,11 @@ func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
 // record in PostgreSQL. Unlike SaveAsync it runs synchronously and returns any
 // error — use this in background workers where you need to know whether the
 // tile was actually persisted before continuing.
-func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash string) error {
+//
+// ndviRaw is the raw float32 NDVI buffer (length = w*h). When non-nil, it is
+// stored as a companion object in MinIO so that GET /api/ndvi-raw can serve
+// pixel-level NDVI values without re-rendering.
+func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash string) error {
 	key := BuildKey(bbox, date, indexType, w, h, polygonHash)
 
 	_, err := s.minio.PutObject(ctx, s.bucket, key,
@@ -283,6 +289,23 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 	if s.rdb != nil {
 		if err := s.rdb.Set(ctx, key, pngBytes, redisJobTTL).Err(); err != nil {
 			fmt.Printf("[cache] redis set error key=%s: %v\n", key, err)
+		}
+	}
+
+	// Store companion raw NDVI binary (little-endian float32 array).
+	if len(ndviRaw) > 0 {
+		rawKey := NDVIRawKey(key)
+		rawBuf := make([]byte, len(ndviRaw)*4)
+		for i, v := range ndviRaw {
+			binary.LittleEndian.PutUint32(rawBuf[i*4:], math.Float32bits(v))
+		}
+		_, putErr := s.minio.PutObject(ctx, s.bucket, rawKey,
+			bytes.NewReader(rawBuf), int64(len(rawBuf)),
+			minio.PutObjectOptions{ContentType: "application/octet-stream"},
+		)
+		if putErr != nil {
+			// Non-fatal — PNG is already saved; raw data is best-effort.
+			fmt.Printf("[cache] minio put raw %q: %v\n", rawKey, putErr)
 		}
 	}
 
@@ -304,6 +327,83 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 		return fmt.Errorf("db insert tile %q: %w", key, err)
 	}
 	return nil
+}
+
+// NDVIRawKey returns the MinIO key for the companion float32 binary of a PNG tile.
+func NDVIRawKey(pngKey string) string {
+	// Strip .png suffix if present and append .ndvi.bin
+	if len(pngKey) > 4 && pngKey[len(pngKey)-4:] == ".png" {
+		return pngKey[:len(pngKey)-4] + ".ndvi.bin"
+	}
+	return pngKey + ".ndvi.bin"
+}
+
+// GetNDVIRaw returns the raw float32 NDVI buffer for a tile identified by its
+// PNG minio_key. Returns the little-endian float32 bytes directly so the HTTP
+// handler can stream them without extra allocation.
+func (s *Store) GetNDVIRaw(ctx context.Context, pngKey string) ([]byte, error) {
+	rawKey := NDVIRawKey(pngKey)
+	obj, err := s.minio.GetObject(ctx, s.bucket, rawKey, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("minio get raw %q: %w", rawKey, err)
+	}
+	defer obj.Close()
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(obj); err != nil {
+		return nil, fmt.Errorf("read raw %q: %w", rawKey, err)
+	}
+	return buf.Bytes(), nil
+}
+
+// TileRenderParams holds the parameters needed to re-render a tile from scratch.
+type TileRenderParams struct {
+	BBox        geo.BBox
+	Date        string
+	W, H        int
+	PolygonHash string
+}
+
+// GetTileByKey looks up tile parameters from the PostgreSQL cache by minio_key.
+// Used to re-render raw NDVI data for tiles that predate the .ndvi.bin feature.
+func (s *Store) GetTileByKey(ctx context.Context, minioKey string) (*TileRenderParams, error) {
+	const q = `
+		SELECT bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
+		       date_acquired::text, width, height, polygon_hash
+		FROM   tile_cache
+		WHERE  minio_key = $1
+		LIMIT  1`
+
+	var rec TileRenderParams
+	var date string
+	err := s.db.QueryRow(ctx, q, minioKey).Scan(
+		&rec.BBox.MinX, &rec.BBox.MinY, &rec.BBox.MaxX, &rec.BBox.MaxY,
+		&date, &rec.W, &rec.H, &rec.PolygonHash,
+	)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get tile by key: %w", err)
+	}
+	rec.Date = date
+	return &rec, nil
+}
+
+// SaveNDVIRawAsync stores a raw float32 NDVI buffer as a companion .ndvi.bin
+// object in MinIO. Runs in a background goroutine — errors are logged only.
+func (s *Store) SaveNDVIRawAsync(pngKey string, rawBytes []byte) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		rawKey := NDVIRawKey(pngKey)
+		_, err := s.minio.PutObject(ctx, s.bucket, rawKey,
+			bytes.NewReader(rawBytes), int64(len(rawBytes)),
+			minio.PutObjectOptions{ContentType: "application/octet-stream"},
+		)
+		if err != nil {
+			fmt.Printf("[cache] SaveNDVIRawAsync %q: %v\n", rawKey, err)
+		}
+	}()
 }
 
 // ── Render jobs ───────────────────────────────────────────────────────────────
