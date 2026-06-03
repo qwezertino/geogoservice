@@ -16,18 +16,7 @@ import (
 	"github.com/qwezert/geogoservice/internal/render"
 )
 
-// createRangeJobRequest is the POST body for POST /api/jobs/render-range.
-type createRangeJobRequest struct {
-	BBox          [4]float64   `json:"bbox"`            // [minX,minY,maxX,maxY] EPSG:3857
-	StartDate     string       `json:"start_date"`      // YYYY-MM-DD
-	EndDate       string       `json:"end_date"`        // YYYY-MM-DD
-	MaxCloudCover float64      `json:"max_cloud_cover"` // 0–100; 0 → server default
-	W             int          `json:"w"`
-	H             int          `json:"h"`
-	Polygon       [][2]float64 `json:"polygon,omitempty"` // WGS-84 [lng, lat] clipping polygon
-}
-
-// jobStatusResponse is the GET /api/jobs/render-range/{id} response.
+// jobStatusResponse is the GET /api/jobs/{id} response.
 type jobStatusResponse struct {
 	ID        string   `json:"id"`
 	Status    string   `json:"status"` // pending/running/done/failed
@@ -37,33 +26,29 @@ type jobStatusResponse struct {
 	CreatedAt string   `json:"created_at"`
 }
 
-// ServeCreateRangeJob handles POST /api/jobs/render-range.
+// createJobRequest is the POST body for POST /api/jobs.
+type createJobRequest struct {
+	BBox          [4]float64   `json:"bbox"`            // [minX,minY,maxX,maxY] EPSG:3857
+	StartDate     string       `json:"start_date"`      // YYYY-MM-DD
+	EndDate       string       `json:"end_date"`        // YYYY-MM-DD
+	MaxCloudCover float64      `json:"max_cloud_cover"` // 0–100; 0 → server default
+	W             int          `json:"w"`
+	H             int          `json:"h"`
+	Polygon       [][2]float64 `json:"polygon,omitempty"` // WGS-84 [lng, lat] clipping polygon
+	Indexes       []string     `json:"indexes,omitempty"` // default: ["ndvi"]
+}
+
+// ServeCreateJob handles POST /api/jobs.
 //
-// It validates the request, creates a job record in PostgreSQL, launches a
-// background worker goroutine, and immediately returns the job ID so the
-// client can poll /api/jobs/render-range/{id} for progress.
-//
-// Request body (JSON):
-//
-//	{
-//	  "bbox": [minX,minY,maxX,maxY],
-//	  "start_date": "2026-03-01",
-//	  "end_date":   "2026-05-31",
-//	  "max_cloud_cover": 20,
-//	  "w": 512, "h": 512,
-//	  "polygon": [[lng,lat], ...]   // optional
-//	}
-//
-// Response 202:
-//
-//	{"job_id": "<uuid>"}
-func (rh *RenderHandler) ServeCreateRangeJob(w http.ResponseWriter, r *http.Request) {
-	var req createRangeJobRequest
+// Like ServeCreateRangeJob but supports multiple spectral indexes per job.
+// The server renders every (scene, index) pair and stores the results with
+// per-tile statistics (min/max/mean/histogram) and cloud cover metadata.
+func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) {
+	var req createJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
 	if req.StartDate == "" || req.EndDate == "" {
 		http.Error(w, "start_date and end_date are required", http.StatusBadRequest)
 		return
@@ -79,10 +64,21 @@ func (rh *RenderHandler) ServeCreateRangeJob(w http.ResponseWriter, r *http.Requ
 	if req.MaxCloudCover <= 0 {
 		req.MaxCloudCover = rh.defaultMaxCloudCover
 	}
+	// Validate index names and fall back to ndvi.
+	validIndexes := map[string]bool{"ndvi": true, "evi": true, "gndvi": true, "cvi": true, "tci": true, "soilmoisture": true}
+	indexes := req.Indexes
+	if len(indexes) == 0 {
+		indexes = []string{"ndvi"}
+	} else {
+		for _, ix := range indexes {
+			if !validIndexes[ix] {
+				http.Error(w, "unsupported index: "+ix, http.StatusBadRequest)
+				return
+			}
+		}
+	}
 
 	bbox := geo.BBox{MinX: req.BBox[0], MinY: req.BBox[1], MaxX: req.BBox[2], MaxY: req.BBox[3]}
-
-	// Build polygon and its hash for tile deduplication.
 	polygon := make([]geo.LngLat, 0, len(req.Polygon))
 	for _, p := range req.Polygon {
 		polygon = append(polygon, geo.LngLat{p[0], p[1]})
@@ -94,34 +90,28 @@ func (rh *RenderHandler) ServeCreateRangeJob(w http.ResponseWriter, r *http.Requ
 
 	if err := rh.store.CreateJob(ctx, jobID, bbox,
 		req.StartDate, req.EndDate, req.MaxCloudCover,
-		req.W, req.H, polygonHash, req.Polygon,
+		req.W, req.H, polygonHash, req.Polygon, indexes,
 	); err != nil {
 		http.Error(w, "failed to create job", http.StatusInternalServerError)
 		log.Printf("[job] create job: %v", err)
 		return
 	}
 
-	// Launch background worker — not bound to the request context so the
-	// render continues even after the HTTP response is sent.
-	go rh.runRangeJob(jobID, bbox, req.StartDate, req.EndDate, req.MaxCloudCover,
-		req.W, req.H, polygon, polygonHash)
+	go rh.runJob(jobID, bbox, req.StartDate, req.EndDate, req.MaxCloudCover,
+		req.W, req.H, polygon, polygonHash, indexes)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{"job_id": jobID})
 }
 
-// ServeRangeJobStatus handles GET /api/jobs/render-range/{id}.
-//
-// Returns the current status, progress counters, and any per-scene error
-// messages accumulated so far.
-func (rh *RenderHandler) ServeRangeJobStatus(w http.ResponseWriter, r *http.Request) {
+// ServeJobStatus handles GET /api/jobs/{id}.
+func (rh *RenderHandler) ServeJobStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "missing job id", http.StatusBadRequest)
 		return
 	}
-
 	job, err := rh.store.GetJob(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, cache.ErrNotFound) {
@@ -132,7 +122,6 @@ func (rh *RenderHandler) ServeRangeJobStatus(w http.ResponseWriter, r *http.Requ
 		log.Printf("[job] get job %s: %v", id, err)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(jobStatusResponse{
 		ID:        job.ID,
@@ -144,27 +133,18 @@ func (rh *RenderHandler) ServeRangeJobStatus(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// ServeRangeJobResults handles GET /api/jobs/render-range/{id}/results.
+// ServeJobResults handles GET /api/jobs/{id}/results.
 //
-// Returns the list of tiles produced by the job — one entry per successfully
-// rendered acquisition date. Each entry carries the minio_key so the client
-// can call POST /api/render/batch with {"minio_key": "..."} to fetch the PNG
-// without triggering a new STAC search or render.
-//
-// Response (JSON array, ordered by date ascending):
-//
-//	[{"date":"2026-03-15","minio_key":"ndvi/2026-03-15/...png"}, ...]
-//
-// Can be called while the job is still running to show partial results.
-func (rh *RenderHandler) ServeRangeJobResults(w http.ResponseWriter, r *http.Request) {
+// Returns all tiles produced by the job, including per-tile stats, cloud cover,
+// and the bbox of each tile. Tiles from all requested indexes are included,
+// sorted by date then index name.
+func (rh *RenderHandler) ServeJobResults(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		http.Error(w, "missing job id", http.StatusBadRequest)
 		return
 	}
-
 	ctx := r.Context()
-
 	params, err := rh.store.GetJobParams(ctx, id)
 	if err != nil {
 		if errors.Is(err, cache.ErrNotFound) {
@@ -175,28 +155,24 @@ func (rh *RenderHandler) ServeRangeJobResults(w http.ResponseWriter, r *http.Req
 		log.Printf("[job] get job params %s: %v", id, err)
 		return
 	}
-
-	tiles, err := rh.store.ListJobTiles(ctx, params)
+	tiles, err := rh.store.ListJobTilesWithStats(ctx, params)
 	if err != nil {
 		http.Error(w, "database error", http.StatusInternalServerError)
 		log.Printf("[job] list job tiles %s: %v", id, err)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(tiles)
 }
 
-// runRangeJob is the background worker for a range render job.
+// runJob is the background worker for a multi-index range job.
 //
-// Algorithm:
-//  1. Find all Sentinel-2 scenes in the date range — one STAC request total.
-//  2. Skip scenes already present in the tile cache (idempotent re-runs).
-//  3. Render remaining scenes in parallel (up to rh.sem concurrency budget,
-//     shared with live render requests so GDAL is never overloaded).
-//  4. Save each PNG to MinIO + PostgreSQL + Redis synchronously before
-//     incrementing done so the progress counter reflects durable writes.
-func (rh *RenderHandler) runRangeJob(
+// For each (scene, index) pair:
+//  1. Skip if a matching tile already exists in the cache.
+//  2. Perform AOI cloud check via SCL band (skips overclouded scenes).
+//  3. Render with render.RenderFromBands.
+//  4. Save PNG + raw values + stats + cloud cover to MinIO + PostgreSQL.
+func (rh *RenderHandler) runJob(
 	jobID string,
 	bbox geo.BBox,
 	startDate, endDate string,
@@ -204,10 +180,10 @@ func (rh *RenderHandler) runRangeJob(
 	w, h int,
 	polygon []geo.LngLat,
 	polygonHash string,
+	indexes []string,
 ) {
 	ctx := context.Background()
 
-	// ── 1. Find all scenes in range ──────────────────────────────────────────
 	bbox4326, err := geo.Transform3857To4326(bbox)
 	if err != nil {
 		_ = rh.store.SetJobFailed(ctx, jobID, fmt.Sprintf("transform bbox: %v", err))
@@ -220,80 +196,78 @@ func (rh *RenderHandler) runRangeJob(
 		return
 	}
 
-	if err := rh.store.SetJobRunning(ctx, jobID, len(scenes)); err != nil {
+	total := len(scenes) * len(indexes)
+	if err := rh.store.SetJobRunning(ctx, jobID, total); err != nil {
 		log.Printf("[job] %s: SetJobRunning: %v", jobID, err)
 	}
-	log.Printf("[job] %s: found %d scenes for %s/%s", jobID, len(scenes), startDate, endDate)
+	log.Printf("[job] %s: found %d scenes × %d indexes = %d tiles", jobID, len(scenes), len(indexes), total)
 
-	// ── 2. Render scenes in parallel ─────────────────────────────────────────
 	var wg sync.WaitGroup
 	for _, scene := range scenes {
-		scene := scene // capture
+		scene := scene
 
-		// Skip if already cached — supports idempotent re-runs.
-		if _, found, _ := rh.store.Lookup(ctx, bbox, scene.Date, "ndvi", w, h, polygonHash); found {
-			log.Printf("[job] %s: skip %s (cached)", jobID, scene.Date)
-			if err := rh.store.IncrJobDone(ctx, jobID); err != nil {
-				log.Printf("[job] %s: IncrJobDone: %v", jobID, err)
+		// AOI cloud check once per scene (not per-index).
+		if scene.Bands.SCLURL != "" {
+			fraction, sclErr := geo.AOICloudFraction(scene.Bands.SCLURL, scene.Bands.GDALConfigOpts, bbox4326)
+			if sclErr != nil {
+				log.Printf("[job] %s: %s: SCL read failed (%v), rendering anyway", jobID, scene.Date, sclErr)
+			} else if fraction*100 > maxCloud {
+				msg := fmt.Sprintf("skip %s: AOI cloud %.0f%% exceeds threshold %.0f%%", scene.Date, fraction*100, maxCloud)
+				log.Printf("[job] %s: %s", jobID, msg)
+				_ = rh.store.AppendJobError(ctx, jobID, msg)
+				// Count all indexes for this scene as "done" (skipped).
+				for range indexes {
+					_ = rh.store.IncrJobDone(ctx, jobID)
+				}
+				continue
 			}
-			continue
 		}
 
-		// Acquire shared render semaphore so we don't overload GDAL.
-		rh.sem <- struct{}{}
-		wg.Add(1)
-		go func() {
-			defer func() { <-rh.sem; wg.Done() }()
+		for _, index := range indexes {
+			index := index
 
-			// ── AOI cloud check via SCL band ─────────────────────────────────
-			// The global eo:cloud_cover metadata describes the whole ~12 000 km²
-			// Sentinel-2 tile, not the specific field. Read the SCL band at low
-			// resolution over the AOI to get a local cloud fraction.
-			skip := false
-			if scene.Bands.SCLURL != "" {
-				fraction, sclErr := geo.AOICloudFraction(scene.Bands.SCLURL, scene.Bands.GDALConfigOpts, bbox4326)
-				if sclErr != nil {
-					log.Printf("[job] %s: %s: SCL read failed (%v), rendering anyway", jobID, scene.Date, sclErr)
-				} else if fraction*100 > maxCloud {
-					msg := fmt.Sprintf("skip %s: AOI cloud %.0f%% exceeds threshold %.0f%%", scene.Date, fraction*100, maxCloud)
-					log.Printf("[job] %s: %s", jobID, msg)
-					_ = rh.store.AppendJobError(ctx, jobID, msg)
-					skip = true
-				}
+			// Skip if already cached.
+			if _, found, _ := rh.store.Lookup(ctx, bbox, scene.Date, index, w, h, polygonHash); found {
+				log.Printf("[job] %s: skip %s/%s (cached)", jobID, scene.Date, index)
+				_ = rh.store.IncrJobDone(ctx, jobID)
+				continue
 			}
 
-			if !skip {
+			rh.sem <- struct{}{}
+			wg.Add(1)
+			go func() {
+				defer func() { <-rh.sem; wg.Done() }()
+
 				params := render.TileParams{
 					BBox:    bbox,
 					Date:    scene.Date,
-					Index:   "ndvi",
+					Index:   index,
 					W:       w,
 					H:       h,
 					Polygon: polygon,
 				}
-
 				result, renderErr := render.RenderFromBands(ctx, scene.Bands, params)
 				if renderErr != nil {
-					msg := fmt.Sprintf("%s: %v", scene.Date, renderErr)
+					msg := fmt.Sprintf("%s/%s: %v", scene.Date, index, renderErr)
 					log.Printf("[job] %s: render failed: %s", jobID, msg)
 					_ = rh.store.AppendJobError(ctx, jobID, msg)
 				} else {
-					if saveErr := rh.store.Save(ctx, bbox, scene.Date, "ndvi", w, h, result.PNG, result.NDVIRaw, polygonHash); saveErr != nil {
-						msg := fmt.Sprintf("%s: save: %v", scene.Date, saveErr)
+					var statsJSON []byte
+					if result.Stats != nil {
+						statsJSON, _ = json.Marshal(result.Stats)
+					}
+					if saveErr := rh.store.Save(ctx, bbox, scene.Date, index, w, h, result.PNG, result.RawValues, polygonHash, statsJSON, scene.CloudCover); saveErr != nil {
+						msg := fmt.Sprintf("%s/%s: save: %v", scene.Date, index, saveErr)
 						log.Printf("[job] %s: %s", jobID, msg)
 						_ = rh.store.AppendJobError(ctx, jobID, msg)
 					}
 				}
-			}
-
-			if err := rh.store.IncrJobDone(ctx, jobID); err != nil {
-				log.Printf("[job] %s: IncrJobDone: %v", jobID, err)
-			}
-		}()
+				_ = rh.store.IncrJobDone(ctx, jobID)
+			}()
+		}
 	}
 
 	wg.Wait()
-
 	if err := rh.store.SetJobDone(ctx, jobID); err != nil {
 		log.Printf("[job] %s: SetJobDone: %v", jobID, err)
 	}

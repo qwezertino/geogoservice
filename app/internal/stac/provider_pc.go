@@ -79,6 +79,15 @@ func (p *planetaryComputerProvider) FindBestScene(ctx context.Context, bbox geo.
 	if scl := best.Assets["SCL"]; scl != nil {
 		bu.SCLURL = applyToken(scl.Href, token)
 	}
+	if b := best.Assets["B02"]; b != nil {
+		bu.BlueURL = applyToken(b.Href, token)
+	}
+	if g := best.Assets["B03"]; g != nil {
+		bu.GreenURL = applyToken(g.Href, token)
+	}
+	if s := best.Assets["B11"]; s != nil {
+		bu.SWIRURL = applyToken(s.Href, token)
+	}
 	return bu, nil
 }
 
@@ -102,6 +111,15 @@ func (p *planetaryComputerProvider) FindScenesInRange(ctx context.Context, bbox 
 			}
 			if scl := f.Assets["SCL"]; scl != nil {
 				bu.SCLURL = applyToken(scl.Href, token)
+			}
+			if b := f.Assets["B02"]; b != nil {
+				bu.BlueURL = applyToken(b.Href, token)
+			}
+			if g := f.Assets["B03"]; g != nil {
+				bu.GreenURL = applyToken(g.Href, token)
+			}
+			if s := f.Assets["B11"]; s != nil {
+				bu.SWIRURL = applyToken(s.Href, token)
 			}
 			return bu, nil
 		})

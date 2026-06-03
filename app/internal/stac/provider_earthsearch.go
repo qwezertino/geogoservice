@@ -62,6 +62,15 @@ func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, 
 	if scl := best.Assets["scl"]; scl != nil {
 		bu.SCLURL = scl.Href
 	}
+	if b := best.Assets["blue"]; b != nil {
+		bu.BlueURL = b.Href
+	}
+	if g := best.Assets["green"]; g != nil {
+		bu.GreenURL = g.Href
+	}
+	if s := best.Assets["swir16"]; s != nil {
+		bu.SWIRURL = s.Href
+	}
 	return bu, nil
 }
 
@@ -78,6 +87,15 @@ func (p *earthSearchProvider) FindScenesInRange(ctx context.Context, bbox geo.BB
 			bu := &BandURLs{RedURL: red.Href, NIRURL: nir.Href}
 			if scl := f.Assets["scl"]; scl != nil {
 				bu.SCLURL = scl.Href
+			}
+			if b := f.Assets["blue"]; b != nil {
+				bu.BlueURL = b.Href
+			}
+			if g := f.Assets["green"]; g != nil {
+				bu.GreenURL = g.Href
+			}
+			if s := f.Assets["swir16"]; s != nil {
+				bu.SWIRURL = s.Href
 			}
 			return bu, nil
 		})

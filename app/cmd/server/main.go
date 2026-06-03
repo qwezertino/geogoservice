@@ -79,17 +79,25 @@ func run() error {
 	// GET /api/ndvi-raw?key=<minio_key> → little-endian float32 array (W×H)
 	mux.HandleFunc("GET /api/ndvi-raw", renderHandler.ServeNDVIRaw)
 
+	// PNG proxy for job-rendered tiles stored in MinIO.
+	// GET /api/images?key=<minio_key> → image/png
+	mux.HandleFunc("GET /api/images", renderHandler.ServeImage)
+
 	// Catalog endpoint — GET returns JSON list of cached NDVI tiles from PostgreSQL.
 	mux.HandleFunc("/api/catalog", renderHandler.ServeCatalog)
 
 	// Delete endpoint — DELETE removes a tile from MinIO, PostgreSQL, and Redis.
 	mux.HandleFunc("/api/tiles", renderHandler.ServeDelete)
 
-	// Range render jobs — renders all available scenes for a bbox+date range.
-	// POST creates a job and returns immediately; GET polls progress by job ID.
-	mux.HandleFunc("POST /api/jobs/render-range", renderHandler.ServeCreateRangeJob)
-	mux.HandleFunc("GET /api/jobs/render-range/{id}", renderHandler.ServeRangeJobStatus)
-	mux.HandleFunc("GET /api/jobs/render-range/{id}/results", renderHandler.ServeRangeJobResults)
+	// Multi-index job API — POST /api/jobs, GET /api/jobs/{id}, …/results.
+	mux.HandleFunc("POST /api/jobs", renderHandler.ServeCreateJob)
+	mux.HandleFunc("GET /api/jobs/{id}", renderHandler.ServeJobStatus)
+	mux.HandleFunc("GET /api/jobs/{id}/results", renderHandler.ServeJobResults)
+
+	// Scene discovery — returns available Sentinel-2 scenes for a polygon and
+	// date range without triggering any rendering.
+	// GET /api/scenes?polygon=<GeoJSON>&date_from=…&date_to=…&max_cloud=20
+	mux.HandleFunc("GET /api/scenes", renderHandler.ServeScenes)
 
 	// Health check (used by Docker Compose and Nginx)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

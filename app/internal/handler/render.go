@@ -3,6 +3,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -131,7 +132,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// ── 2b. Full render pipeline ─────────────────────────────────────────
-		png, renderErr := render.RenderTile(ctx, render.TileParams{
+		res, renderErr := render.RenderTile(ctx, render.TileParams{
 			BBox:             params.bbox3857,
 			Date:             params.date,
 			Index:            params.index,
@@ -146,8 +147,12 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Save to cache — only once, not for every waiting goroutine.
-		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, png, polygonHash)
-		return result{png: png}, nil
+		var statsJSON []byte
+		if res.Stats != nil {
+			statsJSON, _ = json.Marshal(res.Stats)
+		}
+		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, res.PNG, polygonHash, statsJSON, 0)
+		return result{png: res.PNG}, nil
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -231,8 +236,11 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 	if indexType == "" {
 		indexType = "ndvi"
 	}
-	if indexType != "ndvi" {
-		return nil, fmt.Errorf("unsupported index %q; only 'ndvi' is supported", indexType)
+	switch indexType {
+	case "ndvi", "evi", "gndvi", "cvi", "tci", "soilmoisture":
+		// valid
+	default:
+		return nil, fmt.Errorf("unsupported index %q; valid values: ndvi, evi, gndvi, cvi, tci, soilmoisture", indexType)
 	}
 
 	// ── STAC search overrides ─────────────────────────────────────────────────

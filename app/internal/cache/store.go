@@ -148,9 +148,11 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 
 // SaveAsync uploads pngBytes to MinIO and inserts a metadata record in
 // PostgreSQL asynchronously. polygonHash is "" for plain tiles and an 8-char
-// hex string for polygon-masked tiles. Errors are logged but not returned to
-// the caller so that the HTTP response is not blocked.
-func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash string) {
+// hex string for polygon-masked tiles. statsJSON is the JSON-encoded TileStats
+// (may be nil). cloud is the scene-level cloud cover fraction (0–100). Errors
+// are logged but not returned to the caller so that the HTTP response is not
+// blocked.
+func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash string, statsJSON []byte, cloud float64) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -173,12 +175,19 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 			}
 		}
 
+		var statsArg interface{}
+		if len(statsJSON) > 0 {
+			statsArg = string(statsJSON)
+		}
+
 		const ins = `
 			INSERT INTO tile_cache
 				(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-				 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash)
+				 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash,
+				 stats, cloud)
 			VALUES
-				(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11)
+				(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,
+				 $12::jsonb, $13)
 			ON CONFLICT (bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
 			             date_acquired, index_type, width, height, polygon_hash) DO NOTHING`
 
@@ -186,6 +195,7 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 			bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 			date, indexType, w, h,
 			s.bucket, key, polygonHash,
+			statsArg, cloud,
 		)
 		if err != nil {
 			fmt.Printf("[cache] db insert error key=%s: %v\n", key, err)
@@ -272,10 +282,13 @@ func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
 // error — use this in background workers where you need to know whether the
 // tile was actually persisted before continuing.
 //
-// ndviRaw is the raw float32 NDVI buffer (length = w*h). When non-nil, it is
+// ndviRaw is the raw float32 index buffer (length = w*h). When non-nil, it is
 // stored as a companion object in MinIO so that GET /api/ndvi-raw can serve
-// pixel-level NDVI values without re-rendering.
-func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash string) error {
+// pixel-level values without re-rendering.
+//
+// statsJSON is the JSON-encoded render.TileStats (nil when not applicable, e.g.
+// for TCI). cloud is the scene-level cloud cover percentage.
+func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash string, statsJSON []byte, cloud float64) error {
 	key := BuildKey(bbox, date, indexType, w, h, polygonHash)
 
 	_, err := s.minio.PutObject(ctx, s.bucket, key,
@@ -292,7 +305,7 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 		}
 	}
 
-	// Store companion raw NDVI binary (little-endian float32 array).
+	// Store companion raw index binary (little-endian float32 array).
 	if len(ndviRaw) > 0 {
 		rawKey := NDVIRawKey(key)
 		rawBuf := make([]byte, len(ndviRaw)*4)
@@ -309,12 +322,19 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 		}
 	}
 
+	var statsArg interface{}
+	if len(statsJSON) > 0 {
+		statsArg = string(statsJSON)
+	}
+
 	const ins = `
 		INSERT INTO tile_cache
 			(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-			 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash)
+			 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash,
+			 stats, cloud)
 		VALUES
-			(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11)
+			(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,
+			 $12::jsonb, $13)
 		ON CONFLICT (bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
 		             date_acquired, index_type, width, height, polygon_hash) DO NOTHING`
 
@@ -322,6 +342,7 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 		date, indexType, w, h,
 		s.bucket, key, polygonHash,
+		statsArg, cloud,
 	)
 	if err != nil {
 		return fmt.Errorf("db insert tile %q: %w", key, err)
@@ -431,21 +452,34 @@ func (s *Store) CreateJob(
 	w, h int,
 	polygonHash string,
 	polygon [][2]float64,
+	indexes []string,
 ) error {
 	polyJSON, err := json.Marshal(polygon)
 	if err != nil {
 		return fmt.Errorf("marshal polygon: %w", err)
 	}
+	indexesArr := "{ndvi}"
+	if len(indexes) > 0 {
+		// Build a Postgres-compatible array literal like {ndvi,evi}
+		indexesArr = "{"
+		for i, ix := range indexes {
+			if i > 0 {
+				indexesArr += ","
+			}
+			indexesArr += ix
+		}
+		indexesArr += "}"
+	}
 	const q = `
 		INSERT INTO render_jobs
 			(id, bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
-			 start_date, end_date, max_cloud, w, h, polygon_hash, polygon)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+			 start_date, end_date, max_cloud, w, h, polygon_hash, polygon, indexes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
 	_, err = s.db.Exec(ctx, q,
 		id,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 		startDate, endDate, maxCloud, w, h,
-		polygonHash, string(polyJSON),
+		polygonHash, string(polyJSON), indexesArr,
 	)
 	return err
 }
@@ -545,26 +579,34 @@ func (s *Store) GetJobParams(ctx context.Context, id string) (*JobParams, error)
 	return &p, nil
 }
 
-// JobTile is a single rendered scene belonging to a range job.
-type JobTile struct {
-	Date     string `json:"date"`
-	MinioKey string `json:"minio_key"`
+// JobTileResult is the richer per-tile payload returned by the new
+// GET /api/jobs/{id}/results endpoint. It includes cloud cover and stats.
+type JobTileResult struct {
+	Date       string          `json:"date"`
+	Index      string          `json:"index"`
+	MinioKey   string          `json:"minio_key"`
+	CloudCover float64         `json:"cloud_cover"`
+	Stats      json.RawMessage `json:"stats,omitempty"` // raw JSON, may be null
+	BBox       [4]float64      `json:"bbox"`            // [minx, miny, maxx, maxy] EPSG:3857
 }
 
-// ListJobTiles returns all tile_cache rows that match the job's exact bbox,
-// dimensions, polygon_hash, and fall within [startDate, endDate].
-// These are exactly the tiles written by runRangeJob.
-func (s *Store) ListJobTiles(ctx context.Context, p *JobParams) ([]JobTile, error) {
+// ListJobTilesWithStats returns the richer JobTileResult records for a job.
+// It queries tile_cache for all indexes that match the job bbox/dims/hash and
+// fall within the job date range. The stats and cloud columns are included so
+// soft-farm can render charts without additional requests.
+func (s *Store) ListJobTilesWithStats(ctx context.Context, p *JobParams) ([]JobTileResult, error) {
 	const q = `
-		SELECT date_acquired::text, minio_key
+		SELECT date_acquired::text, index_type, minio_key,
+		       COALESCE(cloud, 0),
+		       stats,
+		       bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy
 		FROM   tile_cache
 		WHERE  bbox_3857_minx = $1 AND bbox_3857_miny = $2
 		  AND  bbox_3857_maxx = $3 AND bbox_3857_maxy = $4
 		  AND  width = $5 AND height = $6
 		  AND  polygon_hash = $7
-		  AND  index_type = 'ndvi'
 		  AND  date_acquired BETWEEN $8::date AND $9::date
-		ORDER  BY date_acquired`
+		ORDER  BY date_acquired, index_type`
 
 	rows, err := s.db.Query(ctx, q,
 		p.BBox.MinX, p.BBox.MinY, p.BBox.MaxX, p.BBox.MaxY,
@@ -572,19 +614,30 @@ func (s *Store) ListJobTiles(ctx context.Context, p *JobParams) ([]JobTile, erro
 		p.StartDate, p.EndDate,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("list job tiles: %w", err)
+		return nil, fmt.Errorf("list job tiles with stats: %w", err)
 	}
 	defer rows.Close()
 
-	tiles := make([]JobTile, 0)
+	results := make([]JobTileResult, 0)
 	for rows.Next() {
-		var t JobTile
-		if err := rows.Scan(&t.Date, &t.MinioKey); err != nil {
-			return nil, fmt.Errorf("scan job tile: %w", err)
+		var r JobTileResult
+		var statsRaw []byte
+		var bboxMinX, bboxMinY, bboxMaxX, bboxMaxY float64
+		if err := rows.Scan(
+			&r.Date, &r.Index, &r.MinioKey,
+			&r.CloudCover,
+			&statsRaw,
+			&bboxMinX, &bboxMinY, &bboxMaxX, &bboxMaxY,
+		); err != nil {
+			return nil, fmt.Errorf("scan job tile result: %w", err)
 		}
-		tiles = append(tiles, t)
+		r.BBox = [4]float64{bboxMinX, bboxMinY, bboxMaxX, bboxMaxY}
+		if len(statsRaw) > 0 {
+			r.Stats = json.RawMessage(statsRaw)
+		}
+		results = append(results, r)
 	}
-	return tiles, rows.Err()
+	return results, rows.Err()
 }
 
 // BuildKey creates a deterministic MinIO object key from the tile parameters.

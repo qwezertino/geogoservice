@@ -178,7 +178,7 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	}
 
 	// ── 3. Render ─────────────────────────────────────────────────────────────
-	pngBytes, err := render.RenderTile(ctx, render.TileParams{
+	res, err := render.RenderTile(ctx, render.TileParams{
 		BBox:             bbox,
 		Date:             req.Date,
 		Index:            req.Index,
@@ -192,10 +192,14 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 		return BatchResult{Index: idx, Error: err.Error()}
 	}
 
-	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, pngBytes, polygonHash)
+	var statsJSON []byte
+	if res.Stats != nil {
+		statsJSON, _ = json.Marshal(res.Stats)
+	}
+	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, res.PNG, polygonHash, statsJSON, 0)
 
 	return BatchResult{
 		Index: idx,
-		Data:  base64.StdEncoding.EncodeToString(pngBytes),
+		Data:  base64.StdEncoding.EncodeToString(res.PNG),
 	}
 }

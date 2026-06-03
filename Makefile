@@ -2,14 +2,15 @@
 
 ## setup: prepare data directories with correct permissions (run once after git clone)
 setup:
-	mkdir -p data/postgres data/minio
-	chmod 777 data/postgres data/minio
+	mkdir -p data/postgres
+	chmod 777 data/postgres
 
 ## build: build all Docker images
 build:
 	docker compose build
 
 ## up: start the full stack with 3 replicas (default)
+## NOTE: minio-infra must be running first (cd ../minio-infra && make up)
 up: setup
 	docker compose up -d --build --scale gogeoapp=3
 

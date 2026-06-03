@@ -26,18 +26,23 @@ const (
 // Sentinel2Collection is the Sentinel-2 Level-2A collection ID used by all providers.
 const Sentinel2Collection = "sentinel-2-l2a"
 
-// BandURLs holds the ready-to-use paths for the Red (B04) and NIR (B08) bands
-// of a Sentinel-2 scene, plus optional GDAL config options required to open them.
+// BandURLs holds the ready-to-use paths for the Sentinel-2 bands needed by
+// each spectral index, plus GDAL config options to open them.
 //
-// RedURL and NIRURL may be plain HTTPS URLs (for public providers) or GDAL
-// virtual-filesystem paths such as /vsis3/bucket/key (for CDSE).
+// All URL fields may be plain HTTPS URLs (public providers) or GDAL
+// virtual-filesystem paths like /vsis3/bucket/key (CDSE). Empty string means
+// the band was not found in the STAC item — callers should check before use.
 //
-// GDALConfigOpts carries zero or more "KEY=VALUE" strings that are applied as
-// thread-local GDAL config options before each Open call. Public providers
-// leave this nil; CDSE sets the S3 endpoint and credentials here.
+// GDALConfigOpts carries zero or more "KEY=VALUE" strings applied as
+// thread-local GDAL config options before each Open call.
 type BandURLs struct {
-	RedURL string
-	NIRURL string
+	// Core bands (always present for L2A)
+	RedURL string // B04 (10 m)
+	NIRURL string // B08 (10 m)
+	// Optional bands — filled when the STAC item exposes them
+	BlueURL  string // B02 (10 m) — required for EVI, TCI
+	GreenURL string // B03 (10 m) — required for GNDVI, CVI, TCI
+	SWIRURL  string // B11 (20 m) — required for soilMoisture
 	// SCLURL is the optional URL/path to the Scene Classification Layer (SCL)
 	// band. When set, the job runner reads this at low resolution over the AOI
 	// to measure actual (local) cloud cover before rendering.
@@ -48,8 +53,9 @@ type BandURLs struct {
 
 // SceneInfo is a single satellite scene returned by FindAllScenes.
 type SceneInfo struct {
-	Date       string // YYYY-MM-DD (UTC acquisition date)
-	CloudCover float64
+	Date       string  // YYYY-MM-DD (UTC acquisition date)
+	CloudCover float64 // scene-level cloud cover % from STAC metadata
+	SceneID    string  // STAC item ID (e.g. "S2B_MSIL2A_20240115T...")
 	Bands      *BandURLs
 }
 
@@ -264,6 +270,7 @@ type stacSearchResponse struct {
 // stacRawFeature uses a generic asset map so each provider can look up its own
 // asset keys (e.g. "B04"/"B08" for PC vs "red"/"nir" for Earth Search).
 type stacRawFeature struct {
+	ID         string                `json:"id"`
 	Assets     map[string]*stacAsset `json:"assets"`
 	Properties struct {
 		Datetime   string  `json:"datetime"`
@@ -366,7 +373,7 @@ func findScenesInRangeHelper(
 			fmt.Printf("[stac] findScenesInRange: skip %s — extract failed: %v\n", d, err)
 			continue
 		}
-		scenes = append(scenes, SceneInfo{Date: d, CloudCover: b.cc, Bands: bands})
+		scenes = append(scenes, SceneInfo{Date: d, CloudCover: b.cc, SceneID: b.f.ID, Bands: bands})
 	}
 
 	if len(scenes) == 0 {

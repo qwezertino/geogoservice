@@ -92,6 +92,15 @@ func (p *cdseProvider) FindBestScene(
 	if scl := best.Assets["SCL_20m"]; scl != nil {
 		bu.SCLURL = s3ToVSIS3(scl.Href)
 	}
+	if b := best.Assets["B02_10m"]; b != nil {
+		bu.BlueURL = s3ToVSIS3(b.Href)
+	}
+	if g := best.Assets["B03_10m"]; g != nil {
+		bu.GreenURL = s3ToVSIS3(g.Href)
+	}
+	if s := best.Assets["B11_20m"]; s != nil {
+		bu.SWIRURL = s3ToVSIS3(s.Href)
+	}
 	return bu, nil
 }
 
@@ -120,6 +129,15 @@ func (p *cdseProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, sta
 			}
 			if scl := f.Assets["SCL_20m"]; scl != nil {
 				bu.SCLURL = s3ToVSIS3(scl.Href)
+			}
+			if b := f.Assets["B02_10m"]; b != nil {
+				bu.BlueURL = s3ToVSIS3(b.Href)
+			}
+			if g := f.Assets["B03_10m"]; g != nil {
+				bu.GreenURL = s3ToVSIS3(g.Href)
+			}
+			if s := f.Assets["B11_20m"]; s != nil {
+				bu.SWIRURL = s3ToVSIS3(s.Href)
 			}
 			return bu, nil
 		})
