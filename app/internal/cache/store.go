@@ -81,7 +81,7 @@ type LookupResult struct {
 // cache. polygonHash is "" for plain tiles and an 8-char hex string for
 // polygon-masked tiles. Returns (result, true, nil) on a hit, (nil, false, nil)
 // on a miss, or (nil, false, err) on a database error.
-func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexType string, w, h int, polygonHash string) (*LookupResult, bool, error) {
+func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexType string, w, h int, polygonHash, paletteHash string) (*LookupResult, bool, error) {
 	const q = `
 		SELECT minio_key
 		FROM   tile_cache
@@ -94,12 +94,13 @@ func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexTyp
 		  AND  width          = $7
 		  AND  height         = $8
 		  AND  polygon_hash   = $9
+		  AND  palette_hash   = $10
 		LIMIT 1`
 
 	var key string
 	err := s.db.QueryRow(ctx, q,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
-		date, indexType, w, h, polygonHash,
+		date, indexType, w, h, polygonHash, paletteHash,
 	).Scan(&key)
 	if err != nil {
 		// pgx returns pgx.ErrNoRows which is not a db error
@@ -152,12 +153,12 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 // (may be nil). cloud is the scene-level cloud cover fraction (0–100). Errors
 // are logged but not returned to the caller so that the HTTP response is not
 // blocked.
-func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash string, statsJSON []byte, cloud float64) {
+func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash, paletteHash string, statsJSON []byte, cloud float64) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		key := BuildKey(bbox, date, indexType, w, h, polygonHash)
+		key := BuildKey(bbox, date, indexType, w, h, polygonHash, paletteHash)
 
 		_, err := s.minio.PutObject(ctx, s.bucket, key,
 			bytes.NewReader(pngBytes), int64(len(pngBytes)),
@@ -183,18 +184,18 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 		const ins = `
 			INSERT INTO tile_cache
 				(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-				 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash,
+				 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash, palette_hash,
 				 stats, cloud)
 			VALUES
-				(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,
-				 $12::jsonb, $13)
+				(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,$12,
+				 $13::jsonb, $14)
 			ON CONFLICT (bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-			             date_acquired, index_type, width, height, polygon_hash) DO NOTHING`
+			             date_acquired, index_type, width, height, polygon_hash, palette_hash) DO NOTHING`
 
 		_, err = s.db.Exec(ctx, ins,
 			bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 			date, indexType, w, h,
-			s.bucket, key, polygonHash,
+			s.bucket, key, polygonHash, paletteHash,
 			statsArg, cloud,
 		)
 		if err != nil {
@@ -288,8 +289,8 @@ func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
 //
 // statsJSON is the JSON-encoded render.TileStats (nil when not applicable, e.g.
 // for TCI). cloud is the scene-level cloud cover percentage.
-func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash string, statsJSON []byte, cloud float64) error {
-	key := BuildKey(bbox, date, indexType, w, h, polygonHash)
+func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash, paletteHash string, statsJSON []byte, cloud float64) error {
+	key := BuildKey(bbox, date, indexType, w, h, polygonHash, paletteHash)
 
 	_, err := s.minio.PutObject(ctx, s.bucket, key,
 		bytes.NewReader(pngBytes), int64(len(pngBytes)),
@@ -330,18 +331,18 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 	const ins = `
 		INSERT INTO tile_cache
 			(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-			 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash,
+			 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash, palette_hash,
 			 stats, cloud)
 		VALUES
-			(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,
-			 $12::jsonb, $13)
+			(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,$12,
+			 $13::jsonb, $14)
 		ON CONFLICT (bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-		             date_acquired, index_type, width, height, polygon_hash) DO NOTHING`
+		             date_acquired, index_type, width, height, polygon_hash, palette_hash) DO NOTHING`
 
 	_, err = s.db.Exec(ctx, ins,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 		date, indexType, w, h,
-		s.bucket, key, polygonHash,
+		s.bucket, key, polygonHash, paletteHash,
 		statsArg, cloud,
 	)
 	if err != nil {
@@ -451,6 +452,7 @@ func (s *Store) CreateJob(
 	maxCloud float64,
 	w, h int,
 	polygonHash string,
+	paletteHash string,
 	polygon [][2]float64,
 	indexes []string,
 ) error {
@@ -473,13 +475,13 @@ func (s *Store) CreateJob(
 	const q = `
 		INSERT INTO render_jobs
 			(id, bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
-			 start_date, end_date, max_cloud, w, h, polygon_hash, polygon, indexes)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
+			 start_date, end_date, max_cloud, w, h, polygon_hash, palette_hash, polygon, indexes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`
 	_, err = s.db.Exec(ctx, q,
 		id,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 		startDate, endDate, maxCloud, w, h,
-		polygonHash, string(polyJSON), indexesArr,
+		polygonHash, paletteHash, string(polyJSON), indexesArr,
 	)
 	return err
 }
@@ -554,6 +556,7 @@ type JobParams struct {
 	W           int
 	H           int
 	PolygonHash string
+	PaletteHash string
 }
 
 // GetJobParams returns the stored parameters for a job (bbox, dates, dimensions).
@@ -562,13 +565,13 @@ type JobParams struct {
 func (s *Store) GetJobParams(ctx context.Context, id string) (*JobParams, error) {
 	const q = `
 		SELECT bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
-		       start_date::text, end_date::text, w, h, polygon_hash
+		       start_date::text, end_date::text, w, h, polygon_hash, palette_hash
 		FROM render_jobs WHERE id=$1`
 
 	var p JobParams
 	err := s.db.QueryRow(ctx, q, id).Scan(
 		&p.BBox.MinX, &p.BBox.MinY, &p.BBox.MaxX, &p.BBox.MaxY,
-		&p.StartDate, &p.EndDate, &p.W, &p.H, &p.PolygonHash,
+		&p.StartDate, &p.EndDate, &p.W, &p.H, &p.PolygonHash, &p.PaletteHash,
 	)
 	if err != nil {
 		if err.Error() == "no rows in result set" {
@@ -605,12 +608,13 @@ func (s *Store) ListJobTilesWithStats(ctx context.Context, p *JobParams) ([]JobT
 		  AND  bbox_3857_maxx = $3 AND bbox_3857_maxy = $4
 		  AND  width = $5 AND height = $6
 		  AND  polygon_hash = $7
-		  AND  date_acquired BETWEEN $8::date AND $9::date
+		  AND  palette_hash = $8
+		  AND  date_acquired BETWEEN $9::date AND $10::date
 		ORDER  BY date_acquired, index_type`
 
 	rows, err := s.db.Query(ctx, q,
 		p.BBox.MinX, p.BBox.MinY, p.BBox.MaxX, p.BBox.MaxY,
-		p.W, p.H, p.PolygonHash,
+		p.W, p.H, p.PolygonHash, p.PaletteHash,
 		p.StartDate, p.EndDate,
 	)
 	if err != nil {
@@ -640,21 +644,154 @@ func (s *Store) ListJobTilesWithStats(ctx context.Context, p *JobParams) ([]JobT
 	return results, rows.Err()
 }
 
+// ── API Key management ────────────────────────────────────────────────────────
+
+const redisAuthTTL = 5 * time.Minute
+const redisAuthPrefix = "apikey:"
+
+// APIKey represents a row from the api_keys table.
+type APIKey struct {
+	ID          int64           `json:"id"`
+	Token       string          `json:"token"`
+	Label       string          `json:"label"`
+	Settings    json.RawMessage `json:"settings"`
+	IsActive    bool            `json:"is_active"`
+	CreatedAt   time.Time       `json:"created_at"`
+	LastUsedAt  *time.Time      `json:"last_used_at"`
+}
+
+// CreateAPIKey inserts a new API key row and returns the full record.
+func (s *Store) CreateAPIKey(ctx context.Context, token, label string) (*APIKey, error) {
+	const q = `
+		INSERT INTO api_keys (token, label)
+		VALUES ($1, $2)
+		RETURNING id, token, label, settings, is_active, created_at, last_used_at`
+	var k APIKey
+	row := s.db.QueryRow(ctx, q, token, label)
+	if err := row.Scan(&k.ID, &k.Token, &k.Label, &k.Settings, &k.IsActive, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		return nil, fmt.Errorf("create api key: %w", err)
+	}
+	return &k, nil
+}
+
+// GetAPIKeyByToken fetches an active key by token. Returns ErrNotFound when
+// the token does not exist or is_active=false.
+// Valid tokens are cached in Redis for redisAuthTTL to avoid per-request DB hits.
+func (s *Store) GetAPIKeyByToken(ctx context.Context, token string) (*APIKey, error) {
+	if s.rdb != nil {
+		if data, err := s.rdb.Get(ctx, redisAuthPrefix+token).Bytes(); err == nil {
+			var k APIKey
+			if json.Unmarshal(data, &k) == nil {
+				return &k, nil
+			}
+		}
+	}
+
+	const q = `
+		SELECT id, token, label, settings, is_active, created_at, last_used_at
+		FROM api_keys
+		WHERE token = $1 AND is_active = TRUE
+		LIMIT 1`
+	var k APIKey
+	row := s.db.QueryRow(ctx, q, token)
+	if err := row.Scan(&k.ID, &k.Token, &k.Label, &k.Settings, &k.IsActive, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get api key: %w", err)
+	}
+
+	if s.rdb != nil {
+		if b, err := json.Marshal(k); err == nil {
+			_ = s.rdb.Set(ctx, redisAuthPrefix+token, b, redisAuthTTL).Err()
+		}
+	}
+	return &k, nil
+}
+
+// ListAPIKeys returns all api_keys rows ordered by created_at DESC.
+func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	const q = `
+		SELECT id, token, label, settings, is_active, created_at, last_used_at
+		FROM api_keys
+		ORDER BY created_at DESC`
+	rows, err := s.db.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []APIKey
+	for rows.Next() {
+		var k APIKey
+		if err := rows.Scan(&k.ID, &k.Token, &k.Label, &k.Settings, &k.IsActive, &k.CreatedAt, &k.LastUsedAt); err != nil {
+			return nil, fmt.Errorf("scan api key: %w", err)
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+// DeactivateAPIKey sets is_active=false for the given token and evicts it from Redis.
+// Returns ErrNotFound if no active key with that token exists.
+func (s *Store) DeactivateAPIKey(ctx context.Context, token string) error {
+	const q = `UPDATE api_keys SET is_active = FALSE WHERE token = $1 AND is_active = TRUE`
+	tag, err := s.db.Exec(ctx, q, token)
+	if err != nil {
+		return fmt.Errorf("deactivate api key: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if s.rdb != nil {
+		_ = s.rdb.Del(ctx, redisAuthPrefix+token).Err()
+	}
+	return nil
+}
+
+// UpdateAPIKeySettings replaces the settings JSONB for the key identified by token.
+func (s *Store) UpdateAPIKeySettings(ctx context.Context, token string, settings json.RawMessage) error {
+	const q = `UPDATE api_keys SET settings = $2::jsonb WHERE token = $1 AND is_active = TRUE`
+	tag, err := s.db.Exec(ctx, q, token, settings)
+	if err != nil {
+		return fmt.Errorf("update api key settings: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if s.rdb != nil {
+		_ = s.rdb.Del(ctx, redisAuthPrefix+token).Err()
+	}
+	return nil
+}
+
+// TouchAPIKeyLastUsed updates last_used_at asynchronously (fire-and-forget).
+func (s *Store) TouchAPIKeyLastUsed(ctx context.Context, token string) {
+	go func() {
+		tCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		const q = `UPDATE api_keys SET last_used_at = now() WHERE token = $1`
+		if _, err := s.db.Exec(tCtx, q, token); err != nil {
+			fmt.Printf("[auth] touch last_used_at: %v\n", err)
+		}
+	}()
+}
+
 // BuildKey creates a deterministic MinIO object key from the tile parameters.
 // If polygonHash is non-empty it is appended to the filename, distinguishing
 // polygon-masked tiles from the plain tile with the same bbox/date/dimensions.
 // Exported so workers can construct the result URL before SaveAsync completes.
-func BuildKey(bbox geo.BBox, date, indexType string, w, h int, polygonHash string) string {
-	if polygonHash == "" {
-		return fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d.png",
-			indexType, date,
-			bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
-			w, h,
-		)
+func BuildKey(bbox geo.BBox, date, indexType string, w, h int, polygonHash, paletteHash string) string {
+	suffix := ""
+	if polygonHash != "" {
+		suffix += "_" + polygonHash
 	}
-	return fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d_%s.png",
+	if paletteHash != "" {
+		suffix += "_p" + paletteHash
+	}
+	return fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d%s.png",
 		indexType, date,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
-		w, h, polygonHash,
+		w, h, suffix,
 	)
 }

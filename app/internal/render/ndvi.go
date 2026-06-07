@@ -3,13 +3,14 @@ package render
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"math"
 	"sort"
-	// sort is used by RenderTCIPNG for percentile normalization.
 )
 
 // ─── Per-tile statistics ──────────────────────────────────────────────────────
@@ -113,32 +114,107 @@ func ComputeNDVI(red, nir []float32) ([]float32, error) {
 	return ndvi, nil
 }
 
-// ndviColorMap maps an NDVI value in [-1, 1] to an RGBA colour.
-//
-// Thresholds:
-//   - [-1.0, 0.05) → fully transparent (water / non-vegetation)
-//   - [0.05, 0.2)  → red → yellow gradient (sparse / stressed vegetation)
-//   - [0.2, 1.0]   → light green → dark green gradient (healthy vegetation)
-func ndviColorMap(v float32) color.RGBA {
-	switch {
-	case v < 0.05:
-		// Transparent
-		return color.RGBA{0, 0, 0, 0}
+// ─── Palette types ────────────────────────────────────────────────────────────
 
-	case v < 0.2:
-		// Gradient: red (255,0,0) → yellow (255,255,0)
-		t := float64(v-0.05) / float64(0.2-0.05) // 0..1
-		g := uint8(math.Round(t * 255))
-		return color.RGBA{255, g, 0, 255}
+// PaletteStop maps a scalar index value to an RGBA colour.
+// Stops are linearly interpolated; values outside the stop range clamp to the
+// nearest endpoint. Transparent-to-opaque steps can be approximated by placing
+// two stops 0.001 apart.
+type PaletteStop struct {
+	V    float32  `json:"v"`
+	RGBA [4]uint8 `json:"rgba"`
+}
 
-	default:
-		// Gradient: light green (144,238,144) → dark green (0,100,0)
-		t := float64(v-0.2) / float64(1.0-0.2) // 0..1
-		t = math.Min(1.0, math.Max(0.0, t))
-		r := uint8(math.Round(144 * (1 - t)))
-		g := uint8(math.Round(238 - (238-100)*t))
-		b := uint8(math.Round(144 * (1 - t)))
-		return color.RGBA{r, g, b, 255}
+// DefaultPalette returns the built-in gradient stops for the given index name.
+// These reproduce the hardcoded colour maps that were previously in the source.
+func DefaultPalette(index string) []PaletteStop {
+	switch index {
+	case "evi":
+		return []PaletteStop{
+			{V: 0.050, RGBA: [4]uint8{0, 0, 0, 0}},
+			{V: 0.051, RGBA: [4]uint8{255, 0, 0, 255}},
+			{V: 0.200, RGBA: [4]uint8{255, 255, 0, 255}},
+			{V: 0.201, RGBA: [4]uint8{144, 238, 144, 255}},
+			{V: 1.000, RGBA: [4]uint8{0, 100, 0, 255}},
+		}
+	case "gndvi":
+		return []PaletteStop{
+			{V: 0.150, RGBA: [4]uint8{0, 0, 0, 0}},
+			{V: 0.151, RGBA: [4]uint8{255, 0, 0, 255}},
+			{V: 0.300, RGBA: [4]uint8{255, 255, 0, 255}},
+			{V: 0.301, RGBA: [4]uint8{144, 238, 144, 255}},
+			{V: 1.000, RGBA: [4]uint8{0, 100, 0, 255}},
+		}
+	case "cvi":
+		return []PaletteStop{
+			{V: 1.0, RGBA: [4]uint8{0, 0, 0, 0}},
+			{V: 1.001, RGBA: [4]uint8{144, 238, 144, 255}},
+			{V: 10.0, RGBA: [4]uint8{0, 100, 0, 255}},
+		}
+	case "soilmoisture":
+		return []PaletteStop{
+			{V: 0.0, RGBA: [4]uint8{0, 0, 0, 0}},
+			{V: 0.001, RGBA: [4]uint8{230, 220, 80, 255}},
+			{V: 1.0, RGBA: [4]uint8{0, 55, 255, 255}},
+		}
+	default: // "ndvi" and unknown
+		return []PaletteStop{
+			{V: 0.050, RGBA: [4]uint8{0, 0, 0, 0}},
+			{V: 0.051, RGBA: [4]uint8{255, 0, 0, 255}},
+			{V: 0.200, RGBA: [4]uint8{255, 255, 0, 255}},
+			{V: 0.201, RGBA: [4]uint8{144, 238, 144, 255}},
+			{V: 1.000, RGBA: [4]uint8{0, 100, 0, 255}},
+		}
+	}
+}
+
+// PaletteHash returns an 8-char hex fingerprint of the stops slice.
+// Returns "" for a nil/empty slice (signals "default palette, no extra cache key").
+func PaletteHash(stops []PaletteStop) string {
+	if len(stops) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(stops)
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("%x", sum[:4])
+}
+
+// colorMapFromStops builds a colour-mapping function from sorted gradient stops.
+// Values below the first stop or above the last stop clamp to the endpoint colour.
+// Between stops all four RGBA channels are linearly interpolated.
+func colorMapFromStops(stops []PaletteStop) func(float32) color.RGBA {
+	sorted := make([]PaletteStop, len(stops))
+	copy(sorted, stops)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].V < sorted[j].V })
+
+	toRGBA := func(s PaletteStop) color.RGBA {
+		return color.RGBA{s.RGBA[0], s.RGBA[1], s.RGBA[2], s.RGBA[3]}
+	}
+	lerp := func(a, b uint8, t float64) uint8 {
+		return uint8(math.Round(float64(a)*(1-t) + float64(b)*t))
+	}
+
+	return func(v float32) color.RGBA {
+		if v <= sorted[0].V {
+			return toRGBA(sorted[0])
+		}
+		last := sorted[len(sorted)-1]
+		if v >= last.V {
+			return toRGBA(last)
+		}
+		for i := 1; i < len(sorted); i++ {
+			if v <= sorted[i].V {
+				lo, hi := sorted[i-1], sorted[i]
+				t := float64(v-lo.V) / float64(hi.V-lo.V)
+				return color.RGBA{
+					lerp(lo.RGBA[0], hi.RGBA[0], t),
+					lerp(lo.RGBA[1], hi.RGBA[1], t),
+					lerp(lo.RGBA[2], hi.RGBA[2], t),
+					lerp(lo.RGBA[3], hi.RGBA[3], t),
+				}
+			}
+		}
+		return toRGBA(last)
 	}
 }
 
@@ -152,11 +228,12 @@ func RenderPNG(ndvi []float32, width, height int, maskPoly [][2]float64) ([]byte
 			len(ndvi), width, height, width*height)
 	}
 
+	colorMap := colorMapFromStops(DefaultPalette("ndvi"))
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			idx := y*width + x
-			img.SetRGBA(x, y, ndviColorMap(ndvi[idx]))
+			img.SetRGBA(x, y, colorMap(ndvi[idx]))
 		}
 	}
 
@@ -303,102 +380,18 @@ func ComputeSoilMoisture(nir, swir []float32) ([]float32, error) {
 	return out, nil
 }
 
-// ─── Color maps for other vegetation / moisture indexes ─────────────────────
-
-// eviColorMap maps EVI ∈ [-1, 1] to an RGBA colour.
-// Similar to NDVI but EVI saturates less in dense canopies; same threshold
-// scheme applies.
-func eviColorMap(v float32) color.RGBA {
-	switch {
-	case v < 0.05:
-		return color.RGBA{0, 0, 0, 0}
-	case v < 0.2:
-		t := float64(v-0.05) / 0.15
-		g := uint8(math.Round(t * 255))
-		return color.RGBA{255, g, 0, 255}
-	default:
-		t := math.Min(1.0, float64(v-0.2)/0.8)
-		r := uint8(math.Round(144 * (1 - t)))
-		g := uint8(math.Round(238 - (138)*t))
-		b := uint8(math.Round(144 * (1 - t)))
-		return color.RGBA{r, g, b, 255}
-	}
-}
-
-// gndviColorMap maps GNDVI ∈ [-1, 1] to RGBA.
-// GNDVI is more sensitive to chlorophyll content than NDVI; we use a tighter
-// low-vegetation threshold (0.15) because healthy crops have higher GNDVI.
-func gndviColorMap(v float32) color.RGBA {
-	switch {
-	case v < 0.15:
-		return color.RGBA{0, 0, 0, 0}
-	case v < 0.3:
-		t := float64(v-0.15) / 0.15
-		g := uint8(math.Round(t * 255))
-		return color.RGBA{255, g, 0, 255}
-	default:
-		t := math.Min(1.0, float64(v-0.3)/0.7)
-		r := uint8(math.Round(144 * (1 - t)))
-		g := uint8(math.Round(238 - 138*t))
-		b := uint8(math.Round(144 * (1 - t)))
-		return color.RGBA{r, g, b, 255}
-	}
-}
-
-// cviColorMap maps CVI (Chlorophyll Vegetation Index) ∈ [0, ~10] to RGBA.
-// CVI = NIR × Red / Green² — we normalise to [0, 10] and treat 0–1 as bare.
-func cviColorMap(v float32) color.RGBA {
-	if v < 1.0 {
-		return color.RGBA{0, 0, 0, 0}
-	}
-	// Stretch 1–10 to 0–1.
-	t := float64(v-1.0) / 9.0
-	t = math.Min(1.0, math.Max(0.0, t))
-	r := uint8(math.Round(144 * (1 - t)))
-	g := uint8(math.Round(100 + 138*(1-t)))
-	b := uint8(math.Round(144 * (1 - t)))
-	return color.RGBA{r, g, b, 255}
-}
-
-// moistureColorMap maps soilMoisture (SWIR-based, ∈ [-1, 1]) to RGBA.
-// Negative / zero → transparent. Moist → blue gradient.
-func moistureColorMap(v float32) color.RGBA {
-	if v <= 0.0 {
-		return color.RGBA{0, 0, 0, 0}
-	}
-	t := math.Min(1.0, float64(v))
-	// dry (light yellow) → moist (deep blue)
-	r := uint8(math.Round(230 * (1 - t)))
-	g := uint8(math.Round(220 * (1 - t)))
-	b := uint8(math.Round(80 + 175*t))
-	return color.RGBA{r, g, b, 255}
-}
-
-// colorMapFor returns the color-mapping function for a given index name.
-func colorMapFor(index string) func(float32) color.RGBA {
-	switch index {
-	case "evi":
-		return eviColorMap
-	case "gndvi":
-		return gndviColorMap
-	case "cvi":
-		return cviColorMap
-	case "soilmoisture":
-		return moistureColorMap
-	default: // "ndvi" and any unknown
-		return ndviColorMap
-	}
-}
-
-// RenderIndexPNG is the generalised version of RenderPNG that accepts an index
-// name to select the correct colour map. For index == "ndvi" it is identical
-// to RenderPNG.
-func RenderIndexPNG(values []float32, index string, width, height int, maskPoly [][2]float64) ([]byte, error) {
+// RenderIndexPNG converts a float32 index buffer into a colour-mapped PNG.
+// palette selects the gradient stops; nil uses DefaultPalette(index).
+func RenderIndexPNG(values []float32, index string, width, height int, maskPoly [][2]float64, palette []PaletteStop) ([]byte, error) {
 	if len(values) != width*height {
 		return nil, fmt.Errorf("values buffer length %d != %d×%d=%d",
 			len(values), width, height, width*height)
 	}
-	colorMap := colorMapFor(index)
+	stops := palette
+	if len(stops) == 0 {
+		stops = DefaultPalette(index)
+	}
+	colorMap := colorMapFromStops(stops)
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {

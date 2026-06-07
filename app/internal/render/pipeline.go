@@ -21,6 +21,9 @@ type TileParams struct {
 	// Polygon is an optional WGS-84 clipping polygon ([longitude, latitude] pairs).
 	// Pixels outside the polygon are made transparent in the rendered PNG.
 	Polygon []geo.LngLat
+	// Palette overrides the default gradient colour map for the index.
+	// nil means use DefaultPalette(Index).
+	Palette []PaletteStop
 }
 
 // RenderTile runs the full satellite → index → PNG pipeline and returns a
@@ -180,7 +183,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("compute EVI: %w", err)
 		}
-		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly)
+		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly, p.Palette)
 		if err != nil {
 			return nil, fmt.Errorf("encode EVI PNG: %w", err)
 		}
@@ -203,7 +206,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("compute GNDVI: %w", err)
 		}
-		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly)
+		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly, p.Palette)
 		if err != nil {
 			return nil, fmt.Errorf("encode GNDVI PNG: %w", err)
 		}
@@ -230,7 +233,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("compute CVI: %w", err)
 		}
-		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly)
+		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly, p.Palette)
 		if err != nil {
 			return nil, fmt.Errorf("encode CVI PNG: %w", err)
 		}
@@ -253,7 +256,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("compute soilMoisture: %w", err)
 		}
-		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly)
+		png, err := RenderIndexPNG(vals, index, w, h, pixelPoly, p.Palette)
 		if err != nil {
 			return nil, fmt.Errorf("encode soilMoisture PNG: %w", err)
 		}
@@ -276,7 +279,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("compute NDVI: %w", err)
 		}
-		png, err := RenderIndexPNG(vals, "ndvi", w, h, pixelPoly)
+		png, err := RenderIndexPNG(vals, "ndvi", w, h, pixelPoly, p.Palette)
 		if err != nil {
 			return nil, fmt.Errorf("encode NDVI PNG: %w", err)
 		}

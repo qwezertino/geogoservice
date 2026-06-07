@@ -153,9 +153,10 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 		polygon[i] = geo.LngLat{pt[0], pt[1]}
 	}
 	polygonHash := geo.PolygonHash(polygon)
+	palette, paletteHash := paletteForIndex(APIKeyFromContext(ctx), req.Index)
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────
-	hit, found, err := rh.store.Lookup(ctx, bbox, req.Date, req.Index, req.W, req.H, polygonHash)
+	hit, found, err := rh.store.Lookup(ctx, bbox, req.Date, req.Index, req.W, req.H, polygonHash, paletteHash)
 	if err == nil && found {
 		pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
 		if err == nil {
@@ -187,6 +188,7 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 		SearchWindowDays: searchWindow,
 		MaxCloudCover:    maxCloud,
 		Polygon:          polygon,
+		Palette:          palette,
 	}, rh.stacClient)
 	if err != nil {
 		return BatchResult{Index: idx, Error: err.Error()}
@@ -196,7 +198,7 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	if res.Stats != nil {
 		statsJSON, _ = json.Marshal(res.Stats)
 	}
-	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, res.PNG, polygonHash, statsJSON, 0)
+	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, res.PNG, polygonHash, paletteHash, statsJSON, 0)
 
 	return BatchResult{
 		Index: idx,

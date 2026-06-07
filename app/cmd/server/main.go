@@ -23,6 +23,9 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+//go:embed openapi.yaml
+var openapiSpec []byte
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
@@ -61,49 +64,81 @@ func run() error {
 
 	mux := http.NewServeMux()
 
-	// Core tile endpoint — GET returns PNG (cache hit: fast, miss: GDAL render).
-	// Concurrent GDAL renders are capped at RenderWorkers (default = NumCPU).
 	renderHandler := handler.New(store, stacClient, handler.HandlerOptions{
 		DefaultSearchWindowDays: cfg.STACSearchWindowDays,
 		DefaultMaxCloudCover:    cfg.STACMaxCloudCover,
 		RenderWorkers:           cfg.RenderWorkers,
 	})
-	mux.Handle("/api/render", renderHandler)
+
+	auth  := handler.RequireAPIKey(store)
+	admin := handler.RequireAdmin(cfg.AdminToken)
+
+	// ── Protected API routes (require valid API key) ──────────────────────────
+
+	// Core tile endpoint — GET returns PNG (cache hit: fast, miss: GDAL render).
+	// Concurrent GDAL renders are capped at RenderWorkers (default = NumCPU).
+	mux.Handle("/api/render", auth(renderHandler))
 
 	// Batch tile endpoint — POST returns JSON array of base64-encoded PNGs.
 	// All tiles in the batch are rendered in parallel (shared semaphore).
 	// Client receives all results at once → displays all tiles simultaneously.
-	mux.HandleFunc("/api/render/batch", renderHandler.ServeBatch)
+	mux.Handle("/api/render/batch", auth(http.HandlerFunc(renderHandler.ServeBatch)))
 
 	// Raw NDVI float32 data for pixel-level hover values on the frontend.
 	// GET /api/ndvi-raw?key=<minio_key> → little-endian float32 array (W×H)
-	mux.HandleFunc("GET /api/ndvi-raw", renderHandler.ServeNDVIRaw)
+	mux.Handle("GET /api/ndvi-raw", auth(http.HandlerFunc(renderHandler.ServeNDVIRaw)))
 
 	// PNG proxy for job-rendered tiles stored in MinIO.
 	// GET /api/images?key=<minio_key> → image/png
-	mux.HandleFunc("GET /api/images", renderHandler.ServeImage)
+	mux.Handle("GET /api/images", auth(http.HandlerFunc(renderHandler.ServeImage)))
 
 	// Catalog endpoint — GET returns JSON list of cached NDVI tiles from PostgreSQL.
-	mux.HandleFunc("/api/catalog", renderHandler.ServeCatalog)
+	mux.Handle("/api/catalog", auth(http.HandlerFunc(renderHandler.ServeCatalog)))
 
 	// Delete endpoint — DELETE removes a tile from MinIO, PostgreSQL, and Redis.
-	mux.HandleFunc("/api/tiles", renderHandler.ServeDelete)
+	mux.Handle("/api/tiles", auth(http.HandlerFunc(renderHandler.ServeDelete)))
 
 	// Multi-index job API — POST /api/jobs, GET /api/jobs/{id}, …/results.
-	mux.HandleFunc("POST /api/jobs", renderHandler.ServeCreateJob)
-	mux.HandleFunc("GET /api/jobs/{id}", renderHandler.ServeJobStatus)
-	mux.HandleFunc("GET /api/jobs/{id}/results", renderHandler.ServeJobResults)
+	mux.Handle("POST /api/jobs", auth(http.HandlerFunc(renderHandler.ServeCreateJob)))
+	mux.Handle("GET /api/jobs/{id}", auth(http.HandlerFunc(renderHandler.ServeJobStatus)))
+	mux.Handle("GET /api/jobs/{id}/results", auth(http.HandlerFunc(renderHandler.ServeJobResults)))
 
 	// Scene discovery — returns available Sentinel-2 scenes for a polygon and
 	// date range without triggering any rendering.
 	// GET /api/scenes?polygon=<GeoJSON>&date_from=…&date_to=…&max_cloud=20
-	mux.HandleFunc("GET /api/scenes", renderHandler.ServeScenes)
+	mux.Handle("GET /api/scenes", auth(http.HandlerFunc(renderHandler.ServeScenes)))
+
+	// ── Self-service endpoints (require valid API key) ────────────────────────
+
+	mux.Handle("GET /api/me", auth(http.HandlerFunc(renderHandler.ServeGetMe)))
+	mux.Handle("PUT /api/me/settings", auth(http.HandlerFunc(renderHandler.ServeUpdateSettings)))
+
+	// ── Admin endpoints (require X-Admin-Token header) ────────────────────────
+
+	mux.Handle("POST /api/admin/keys", admin(http.HandlerFunc(renderHandler.ServeCreateAPIKey)))
+	mux.Handle("GET /api/admin/keys", admin(http.HandlerFunc(renderHandler.ServeListAPIKeys)))
+	mux.Handle("DELETE /api/admin/keys/{token}", admin(http.HandlerFunc(renderHandler.ServeDeleteAPIKey)))
+
+	// ── Public ────────────────────────────────────────────────────────────────
 
 	// Health check (used by Docker Compose and Nginx)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintln(w, "ok")
+	})
+
+	// OpenAPI spec — served as YAML for tooling and Swagger UI to consume.
+	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write(openapiSpec)
+	})
+
+	// Swagger UI — loads from CDN, points at /openapi.yaml on the same origin.
+	mux.HandleFunc("GET /swagger/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, swaggerUI)
 	})
 
 	srv := &http.Server{

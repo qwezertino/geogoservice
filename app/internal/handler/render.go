@@ -93,10 +93,11 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	polygonHash := geo.PolygonHash(params.polygon)
+	palette, paletteHash := paletteForIndex(APIKeyFromContext(ctx), params.index)
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────
 	if !params.noCache {
-		hit, found, err := rh.store.Lookup(ctx, params.bbox3857, params.date, params.index, params.w, params.h, polygonHash)
+		hit, found, err := rh.store.Lookup(ctx, params.bbox3857, params.date, params.index, params.w, params.h, polygonHash, paletteHash)
 		if err != nil {
 			http.Error(w, "cache lookup error", http.StatusInternalServerError)
 			fmt.Printf("[handler] cache lookup: %v\n", err)
@@ -117,7 +118,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	// ── 2. Singleflight: deduplicate concurrent renders for the same tile ────────
 	// If N requests arrive for the same bbox/date/index/size simultaneously,
 	// only one GDAL render runs — all others share the result.
-	sfKey := cache.BuildKey(params.bbox3857, params.date, params.index, params.w, params.h, polygonHash)
+	sfKey := cache.BuildKey(params.bbox3857, params.date, params.index, params.w, params.h, polygonHash, paletteHash)
 	type result struct {
 		png []byte
 		err error
@@ -141,6 +142,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 			SearchWindowDays: params.searchWindowDays,
 			MaxCloudCover:    params.maxCloudCover,
 			Polygon:          params.polygon,
+			Palette:          palette,
 		}, rh.stacClient)
 		if renderErr != nil {
 			return nil, renderErr
@@ -151,7 +153,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 		if res.Stats != nil {
 			statsJSON, _ = json.Marshal(res.Stats)
 		}
-		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, res.PNG, polygonHash, statsJSON, 0)
+		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, res.PNG, polygonHash, paletteHash, statsJSON, 0)
 		return result{png: res.PNG}, nil
 	})
 	if err != nil {

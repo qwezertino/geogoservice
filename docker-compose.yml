@@ -5,7 +5,7 @@ x-app-env: &app-env
   DB_USER: ${DB_USER}
   DB_PASSWORD: ${DB_PASSWORD}
   DB_NAME: ${DB_NAME}
-  MINIO_ENDPOINT: minio:9000    # internal container address – never changes
+  MINIO_ENDPOINT: ${MINIO_ENDPOINT}
   MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
   MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
   MINIO_BUCKET: ${MINIO_BUCKET}
@@ -35,6 +35,8 @@ x-app-env: &app-env
   # Generate at: https://eodata-s3keysmanager.dataspace.copernicus.eu/
   CDSE_S3_ACCESS_KEY: ${CDSE_S3_ACCESS_KEY:-}
   CDSE_S3_SECRET_KEY: ${CDSE_S3_SECRET_KEY:-}
+  # Admin token for /api/admin/* endpoints
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-}
 
 services:
   # ── PostGIS ─────────────────────────────────────────────────────────────────
@@ -62,21 +64,22 @@ services:
   # MinIO itself lives in the separate minio-infra project.
   minio-init:
     image: minio/mc:latest
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-ndvi-tiles}
     entrypoint: >
       /bin/sh -c "
-        until mc alias set local http://minio:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY; do
+        until mc alias set local http://$$MINIO_ENDPOINT $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY; do
           echo 'Waiting for MinIO...'; sleep 3;
         done &&
         mc mb --ignore-existing local/$$MINIO_BUCKET &&
         mc anonymous set download local/$$MINIO_BUCKET
       "
     restart: "on-failure"
-    networks:
-      - shared-infra
 
   # ── Redis (shared L2 tile cache) ─────────────────────────────────────────
   redis:
@@ -95,6 +98,8 @@ services:
   gogeoapp:
     build: ./app
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       <<: *app-env
     depends_on:
@@ -104,10 +109,6 @@ services:
         condition: service_healthy
     expose:
       - "8080"
-    networks:
-      - default
-      - shared-infra
-
   # ── Nginx load balancer ─────────────────────────────────────────────────────
   nginx:
     image: nginx:1.25-alpine
@@ -118,13 +119,5 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - gogeoapp
-
-# ── Networks ────────────────────────────────────────────────────────────────
-# shared-infra must be created once: docker network create shared-infra
-# or via `make network` in the minio-infra project.
-networks:
-  shared-infra:
-    external: true
-    name: shared-infra
 
 # Data is persisted in ./data/ — stop/start containers freely without data loss.

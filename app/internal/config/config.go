@@ -51,6 +51,10 @@ type Config struct {
 	// Format: redis://[user:password@]host:port/db
 	// If empty, Redis is disabled and tiles are always fetched from MinIO.
 	RedisURL string
+
+	// AdminToken protects /api/admin/* endpoints.
+	// Optional: if empty, admin endpoints return 503 Service Unavailable.
+	AdminToken string
 }
 
 // Load reads configuration from environment variables and returns a Config.
@@ -111,6 +115,7 @@ func Load() (*Config, error) {
 		RenderWorkers:        func() int { n, _ := strconv.Atoi(os.Getenv("RENDER_WORKERS")); return n }(),
 		CDSES3AccessKey:      os.Getenv("CDSE_S3_ACCESS_KEY"),
 		CDSES3SecretKey:      os.Getenv("CDSE_S3_SECRET_KEY"),
+		AdminToken:           os.Getenv("ADMIN_TOKEN"),
 	}, nil
 }
 

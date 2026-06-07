@@ -1,0 +1,1026 @@
+openapi: "3.0.3"
+
+info:
+  title: GeoGo Service API
+  version: "1.0.0"
+  description: |
+    Satellite imagery rendering service for spectral indexes (NDVI, EVI, GNDVI, CVI, TCI, Soil Moisture)
+    based on Sentinel-2 scenes. Tiles are rendered on demand, cached in MinIO + PostgreSQL,
+    and optionally colorised with per-token custom palettes.
+
+    ## Authentication
+
+    All `/api/*` endpoints require an API key passed via one of:
+    - `X-API-Key: <token>` header
+    - `Authorization: Bearer <token>` header
+
+    Admin endpoints (`/api/admin/*`) require a separate `X-Admin-Token` header
+    configured server-side via the `ADMIN_TOKEN` environment variable.
+
+servers:
+  - url: /
+    description: Current server
+
+tags:
+  - name: Render
+    description: On-demand tile rendering and batch operations
+  - name: Jobs
+    description: Asynchronous multi-index range rendering jobs
+  - name: Catalog
+    description: Querying and managing cached tiles
+  - name: Scenes
+    description: Sentinel-2 scene discovery without rendering
+  - name: Me
+    description: Self-service API key management and settings
+  - name: Admin
+    description: API key administration (requires X-Admin-Token)
+  - name: System
+    description: Health check and auxiliary endpoints
+
+components:
+  securitySchemes:
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key token
+    BearerToken:
+      type: http
+      scheme: bearer
+      description: API key token passed as Bearer token
+    AdminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description: Server-side admin token (set via ADMIN_TOKEN env var)
+
+  schemas:
+    # ── Common ────────────────────────────────────────────────────────────────
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "invalid token"
+
+    # ── Spectral index enum ───────────────────────────────────────────────────
+
+    SpectralIndex:
+      type: string
+      enum: [ndvi, evi, gndvi, cvi, tci, soilmoisture]
+      description: |
+        Spectral index to render:
+        - `ndvi` — Normalized Difference Vegetation Index
+        - `evi` — Enhanced Vegetation Index
+        - `gndvi` — Green NDVI
+        - `cvi` — Chlorophyll Vegetation Index
+        - `tci` — Triangular Chlorophyll Index
+        - `soilmoisture` — Soil Moisture Index
+
+    # ── Palette ───────────────────────────────────────────────────────────────
+
+    PaletteStop:
+      type: object
+      required: [v, rgba]
+      properties:
+        v:
+          type: number
+          format: float
+          minimum: -1
+          maximum: 1
+          description: Index value at this color stop (NDVI/EVI range is roughly −1…1)
+          example: 0.3
+        rgba:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          minItems: 4
+          maxItems: 4
+          description: "[R, G, B, A] — alpha 0 = transparent, 255 = opaque"
+          example: [0, 180, 0, 255]
+
+    # ── API Key ───────────────────────────────────────────────────────────────
+
+    APIKey:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 7
+        token:
+          type: string
+          example: "vQhKLJmuubLViKxS_Wlt1BFkNneJdsTDvTAQu6uQvmc"
+        label:
+          type: string
+          example: "frontend-prod"
+        settings:
+          $ref: "#/components/schemas/KeySettings"
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    KeySettings:
+      type: object
+      description: Arbitrary JSON settings stored per API key. The `palettes` field is processed by the server; all other fields are stored as-is.
+      properties:
+        palettes:
+          type: object
+          description: Per-index custom color palettes. Keys are spectral index names.
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/PaletteStop"
+          example:
+            ndvi:
+              - { v: 0.05,  rgba: [0, 0, 0, 0] }
+              - { v: 0.051, rgba: [255, 0, 0, 255] }
+              - { v: 0.3,   rgba: [255, 255, 0, 255] }
+              - { v: 1.0,   rgba: [0, 100, 0, 255] }
+      additionalProperties: true
+
+    # ── Render ────────────────────────────────────────────────────────────────
+
+    BatchRequest:
+      type: object
+      required: [bbox, date, index, w, h]
+      properties:
+        minio_key:
+          type: string
+          description: |
+            When provided, bypasses all rendering and STAC calls — the PNG is fetched
+            directly from MinIO. Use the key returned by GET /api/catalog.
+          example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
+        bbox:
+          type: array
+          items: { type: number }
+          minItems: 4
+          maxItems: 4
+          description: "[minX, minY, maxX, maxY] in EPSG:3857"
+          example: [3674576.37, 6259695.78, 3677117.90, 6262313.74]
+        date:
+          type: string
+          format: date
+          description: Target acquisition date (YYYY-MM-DD). The server searches within `search_window_days` around this date.
+          example: "2026-05-08"
+        index:
+          $ref: "#/components/schemas/SpectralIndex"
+        w:
+          type: integer
+          minimum: 1
+          maximum: 2048
+          description: Output tile width in pixels
+          example: 256
+        h:
+          type: integer
+          minimum: 1
+          maximum: 2048
+          description: Output tile height in pixels
+          example: 256
+        search_window_days:
+          type: integer
+          minimum: 1
+          description: Days to search around `date` for a low-cloud scene. Defaults to server setting (15 days).
+          example: 15
+        max_cloud_cover:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Maximum acceptable cloud cover % for scene selection. Defaults to server setting (20%).
+          example: 20
+        polygon:
+          type: array
+          items:
+            type: array
+            items: { type: number }
+            minItems: 2
+            maxItems: 2
+          description: "WGS-84 clipping polygon as [[longitude, latitude], …] pairs. Pixels outside become transparent."
+          example: [[30.5, 50.4], [30.6, 50.4], [30.6, 50.5], [30.5, 50.5]]
+
+    BatchResult:
+      type: object
+      properties:
+        index:
+          type: integer
+          description: Position of this result in the input array
+        data:
+          type: string
+          format: byte
+          description: Base64-encoded PNG (present on success)
+        cached:
+          type: boolean
+          description: true if the PNG was served from cache without rendering
+        error:
+          type: string
+          description: Error message (present on failure; `data` is absent)
+
+    # ── Jobs ─────────────────────────────────────────────────────────────────
+
+    CreateJobRequest:
+      type: object
+      required: [bbox, start_date, end_date, w, h]
+      properties:
+        bbox:
+          type: array
+          items: { type: number }
+          minItems: 4
+          maxItems: 4
+          description: "[minX, minY, maxX, maxY] in EPSG:3857"
+          example: [3674576.37, 6259695.78, 3677117.90, 6262313.74]
+        start_date:
+          type: string
+          format: date
+          example: "2026-04-01"
+        end_date:
+          type: string
+          format: date
+          example: "2026-05-31"
+        max_cloud_cover:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Maximum cloud cover % for scene selection. 0 uses server default (20%).
+          example: 20
+        w:
+          type: integer
+          minimum: 1
+          maximum: 2048
+          example: 256
+        h:
+          type: integer
+          minimum: 1
+          maximum: 2048
+          example: 256
+        polygon:
+          type: array
+          items:
+            type: array
+            items: { type: number }
+            minItems: 2
+            maxItems: 2
+          description: "WGS-84 clipping polygon [[lng, lat], …]. Pixels outside become transparent."
+          example: [[30.5, 50.4], [30.6, 50.4], [30.6, 50.5], [30.5, 50.5]]
+        indexes:
+          type: array
+          items:
+            $ref: "#/components/schemas/SpectralIndex"
+          description: Spectral indexes to render. Defaults to ["ndvi"].
+          example: ["ndvi", "evi"]
+
+    JobStatus:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          type: string
+          enum: [pending, running, done, failed]
+        done:
+          type: integer
+          description: Number of tiles completed (rendered or skipped)
+        total:
+          type: integer
+          description: Total tiles to process (scenes × indexes)
+        errors:
+          type: array
+          items: { type: string }
+          description: Per-tile error messages (skipped scenes are listed here too)
+        created_at:
+          type: string
+          format: date-time
+
+    TileResult:
+      type: object
+      description: A single rendered tile from a job's result set
+      properties:
+        date:
+          type: string
+          format: date
+        index_type:
+          $ref: "#/components/schemas/SpectralIndex"
+        minio_key:
+          type: string
+          description: Pass to GET /api/images or POST /api/render/batch (minio_key field)
+          example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256_5ba19d23.png"
+        cloud_cover:
+          type: number
+          description: Scene-level cloud cover %
+        stats:
+          type: object
+          description: Per-tile pixel statistics (min, max, mean, histogram)
+          nullable: true
+          properties:
+            min:
+              type: number
+            max:
+              type: number
+            mean:
+              type: number
+            histogram:
+              type: array
+              items: { type: integer }
+
+    # ── Catalog ───────────────────────────────────────────────────────────────
+
+    CatalogTile:
+      type: object
+      properties:
+        minio_key:
+          type: string
+          example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
+        date_acquired:
+          type: string
+          format: date
+        index_type:
+          $ref: "#/components/schemas/SpectralIndex"
+        width:
+          type: integer
+        height:
+          type: integer
+        bbox_3857:
+          type: array
+          items: { type: number }
+          description: "[minX, minY, maxX, maxY] in EPSG:3857"
+
+    # ── Scenes ────────────────────────────────────────────────────────────────
+
+    Scene:
+      type: object
+      properties:
+        scene_id:
+          type: string
+          example: "S2B_MSIL2A_20260508T083559_N0511_R064_T36UYA_20260508T112345"
+        date:
+          type: string
+          format: date
+          example: "2026-05-08"
+        cloud_cover:
+          type: number
+          example: 4.2
+
+# ── Security defaults ─────────────────────────────────────────────────────────
+
+security:
+  - ApiKeyHeader: []
+  - BearerToken: []
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+paths:
+
+  # ── Render ──────────────────────────────────────────────────────────────────
+
+  /api/render:
+    get:
+      tags: [Render]
+      summary: Render a single spectral index tile
+      description: |
+        Returns a 256×256 (or custom size) PNG tile for the given bounding box, date, and spectral index.
+        On cache hit the response is immediate. On miss the server searches for the best Sentinel-2 scene
+        within `window` days of `date`, downloads the relevant bands via GDAL/VSICURL, computes the index,
+        and returns the colourised PNG.
+
+        Accepts both modern and legacy GeoServer parameter names.
+
+        The color palette is determined by the API key's settings (`palettes.<index>`).
+        If no custom palette is set, the server default is used. Tiles with different palettes
+        are cached independently.
+      parameters:
+        - name: bbox
+          in: query
+          required: true
+          description: "Bounding box in EPSG:3857 as `minX,minY,maxX,maxY`"
+          schema:
+            type: string
+          example: "3674576.37,6259695.78,3677117.90,6262313.74"
+        - name: date
+          in: query
+          required: true
+          description: "Target date as YYYY-MM-DD or Unix timestamp (seconds)"
+          schema:
+            type: string
+          example: "2026-05-08"
+        - name: index
+          in: query
+          description: "Spectral index to render (alias: `indexName`). Defaults to `ndvi`."
+          schema:
+            $ref: "#/components/schemas/SpectralIndex"
+        - name: w
+          in: query
+          required: true
+          description: "Output width in pixels 1–2048 (alias: `width`)"
+          schema:
+            type: integer
+          example: 256
+        - name: h
+          in: query
+          required: true
+          description: "Output height in pixels 1–2048 (alias: `height`)"
+          schema:
+            type: integer
+          example: 256
+        - name: window
+          in: query
+          description: "Search window around `date` in days. Default: server setting (15)."
+          schema:
+            type: integer
+            minimum: 1
+        - name: cloud
+          in: query
+          description: "Max cloud cover % for scene selection (0–100). Default: server setting (20)."
+          schema:
+            type: number
+        - name: polygon
+          in: query
+          description: "Clipping polygon as flat `lng1,lat1,lng2,lat2,…` string (WGS-84, min 3 pairs). Pixels outside become transparent."
+          schema:
+            type: string
+          example: "30.5,50.4,30.6,50.4,30.6,50.5,30.5,50.5"
+        - name: nocache
+          in: query
+          description: "Set to `1` or `true` to skip cache read/write (useful for load testing)."
+          schema:
+            type: string
+            enum: ["1", "true"]
+      responses:
+        "200":
+          description: PNG tile
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid parameters
+        "401":
+          description: Missing or invalid API key
+        "500":
+          description: Render or storage failure
+        "503":
+          description: Request cancelled (server shutting down)
+
+  /api/render/batch:
+    post:
+      tags: [Render]
+      summary: Render multiple tiles in parallel
+      description: |
+        Accepts a JSON array of up to 100 tile requests and renders all in parallel
+        (subject to the shared GDAL worker semaphore). Returns a JSON array in the
+        same order as the input — the client can set all `<img src>` attributes at once
+        so all tiles appear simultaneously.
+
+        When `minio_key` is provided on an item, rendering and STAC search are bypassed —
+        the PNG is fetched directly from MinIO. Use keys returned by GET /api/catalog
+        or GET /api/jobs/{id}/results for this fast path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/BatchRequest"
+              maxItems: 100
+            example:
+              - bbox: [3674576.37, 6259695.78, 3677117.90, 6262313.74]
+                date: "2026-05-08"
+                index: ndvi
+                w: 256
+                h: 256
+              - bbox: [3674576.37, 6259695.78, 3677117.90, 6262313.74]
+                date: "2026-05-08"
+                index: evi
+                w: 256
+                h: 256
+      responses:
+        "200":
+          description: Array of results in input order
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BatchResult"
+        "400":
+          description: Invalid JSON or empty/oversized batch
+        "401":
+          description: Missing or invalid API key
+
+  /api/ndvi-raw:
+    get:
+      tags: [Render]
+      summary: Raw float32 index values for a tile
+      description: |
+        Returns the raw float32 buffer for a tile as little-endian IEEE-754 bytes,
+        row-major, length = W×H. Useful for hover tooltips and pixel-level analysis
+        on the frontend.
+
+        **Self-healing**: if the `.ndvi.bin` companion was not saved when the tile was
+        originally rendered, the server transparently re-fetches bands from STAC,
+        recomputes the index, persists the raw file to MinIO, and returns the data.
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: MinIO object key of the PNG tile (from GET /api/catalog or job results)
+          schema:
+            type: string
+          example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
+      responses:
+        "200":
+          description: |
+            Little-endian IEEE-754 float32 buffer, W×H values in row-major order.
+            Parse with `new Float32Array(buffer)` in JavaScript.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: "max-age=86400, immutable"
+        "400":
+          description: Missing or invalid key
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Tile not found in database
+        "502":
+          description: STAC or band read failure during self-healing re-render
+
+  /api/images:
+    get:
+      tags: [Render]
+      summary: Proxy PNG from MinIO by key
+      description: |
+        Streams the PNG stored in MinIO for the given key. Used as a proxy so the
+        frontend can display job-rendered tiles without direct MinIO access.
+        The `Cache-Control` header is set to `immutable` — the key encodes all render
+        parameters so the content never changes.
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: MinIO object key (from GET /api/catalog or GET /api/jobs/{id}/results)
+          schema:
+            type: string
+          example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
+      responses:
+        "200":
+          description: PNG image
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: "max-age=86400, immutable"
+        "400":
+          description: Missing or invalid key
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Object not found in MinIO
+
+  # ── Jobs ────────────────────────────────────────────────────────────────────
+
+  /api/jobs:
+    post:
+      tags: [Jobs]
+      summary: Create an async multi-index rendering job
+      description: |
+        Enqueues a background job that renders every (scene, index) combination found
+        in the given date range and bounding box. The server discovers Sentinel-2 scenes
+        via STAC, performs an AOI cloud-fraction check on each scene, and renders +
+        saves all tiles to MinIO + PostgreSQL with per-tile statistics.
+
+        Already-cached tiles are skipped. The palette stored in the API key's settings
+        at the moment of job creation is captured and applied to all tiles — it won't
+        change if you update your settings mid-run.
+
+        Poll GET /api/jobs/{id} for progress and GET /api/jobs/{id}/results for the
+        finished tile list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+            example:
+              bbox: [3674576.37, 6259695.78, 3677117.90, 6262313.74]
+              start_date: "2026-04-01"
+              end_date: "2026-05-31"
+              max_cloud_cover: 20
+              w: 256
+              h: 256
+              indexes: ["ndvi", "evi"]
+              polygon: [[30.5, 50.4], [30.6, 50.4], [30.6, 50.5], [30.5, 50.5]]
+      responses:
+        "202":
+          description: Job accepted and running in the background
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+              example:
+                job_id: "550e8400-e29b-41d4-a716-446655440000"
+        "400":
+          description: Invalid parameters (missing dates, bad bbox, unknown index)
+        "401":
+          description: Missing or invalid API key
+        "500":
+          description: Failed to persist job to database
+
+  /api/jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get job status and progress
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        "200":
+          description: Job status object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatus"
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Job not found
+
+  /api/jobs/{id}/results:
+    get:
+      tags: [Jobs]
+      summary: Get all tiles produced by a job
+      description: |
+        Returns all tiles produced by the job, sorted by date then index name.
+        Only available once the job status is `done`. Tiles from all requested
+        indexes are included. The `minio_key` field can be passed directly to
+        GET /api/images or POST /api/render/batch.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        "200":
+          description: Array of rendered tiles with stats
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TileResult"
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Job not found
+
+  # ── Catalog ─────────────────────────────────────────────────────────────────
+
+  /api/catalog:
+    get:
+      tags: [Catalog]
+      summary: List cached tiles by year and bounding box
+      description: |
+        Returns all tiles in the cache that were acquired in `year` and whose bbox
+        intersects the given WGS-84 `bbox`. Always returns `[]` (not `null`) when
+        there are no results.
+
+        The `minio_key` from each result can be used with GET /api/images,
+        GET /api/ndvi-raw, or POST /api/render/batch.
+      parameters:
+        - name: year
+          in: query
+          required: true
+          description: Acquisition year (2015–2100)
+          schema:
+            type: integer
+          example: 2026
+        - name: bbox
+          in: query
+          required: true
+          description: "WGS-84 bounding box as `minLng,minLat,maxLng,maxLat`"
+          schema:
+            type: string
+          example: "30.43,50.37,30.55,50.47"
+      responses:
+        "200":
+          description: Array of cached tile metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CatalogTile"
+        "400":
+          description: Missing or invalid parameters
+        "401":
+          description: Missing or invalid API key
+
+  /api/tiles:
+    delete:
+      tags: [Catalog]
+      summary: Delete a cached tile
+      description: |
+        Removes the tile identified by its MinIO object key from all three stores:
+        MinIO, PostgreSQL, and Redis (if enabled). The key is returned by GET /api/catalog
+        in the `minio_key` field.
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: MinIO object key of the tile to delete
+          schema:
+            type: string
+          example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
+      responses:
+        "200":
+          description: Deletion confirmed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: string
+              example:
+                deleted: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
+        "400":
+          description: Missing or invalid key
+        "401":
+          description: Missing or invalid API key
+        "500":
+          description: Storage deletion failure
+
+  # ── Scenes ──────────────────────────────────────────────────────────────────
+
+  /api/scenes:
+    get:
+      tags: [Scenes]
+      summary: Discover available Sentinel-2 scenes
+      description: |
+        Returns all available Sentinel-2 scenes for the given polygon and date range
+        **without triggering any rendering**. Useful for previewing what data is available
+        before creating a job.
+
+        The `polygon` parameter is a URL-encoded GeoJSON Polygon object.
+      parameters:
+        - name: polygon
+          in: query
+          required: true
+          description: URL-encoded GeoJSON Polygon (type "Polygon", outer ring in WGS-84)
+          schema:
+            type: string
+          example: '{"type":"Polygon","coordinates":[[[30.43,50.37],[30.55,50.37],[30.55,50.47],[30.43,50.47],[30.43,50.37]]]}'
+        - name: date_from
+          in: query
+          required: true
+          description: Start of date range (inclusive), YYYY-MM-DD
+          schema:
+            type: string
+            format: date
+          example: "2026-04-01"
+        - name: date_to
+          in: query
+          required: true
+          description: End of date range (inclusive), YYYY-MM-DD
+          schema:
+            type: string
+            format: date
+          example: "2026-05-31"
+        - name: max_cloud
+          in: query
+          description: Maximum cloud cover % (0–100). Default 20.
+          schema:
+            type: number
+          example: 20
+      responses:
+        "200":
+          description: Array of scenes ordered by date ascending
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Scene"
+        "400":
+          description: Invalid or missing parameters
+        "401":
+          description: Missing or invalid API key
+
+  # ── Me ──────────────────────────────────────────────────────────────────────
+
+  /api/me:
+    get:
+      tags: [Me]
+      summary: Get own API key details
+      description: Returns the full API key object associated with the current token, including stored settings.
+      responses:
+        "200":
+          description: Current API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKey"
+        "401":
+          description: Missing or invalid API key
+
+  /api/me/settings:
+    put:
+      tags: [Me]
+      summary: Update own settings
+      description: |
+        Replaces the settings JSON for the current API key. The body must be a valid
+        JSON object (max 64 KB). The entire `settings` field is replaced — use GET /api/me
+        to read current settings before updating if you need to merge.
+
+        The `palettes` field is interpreted by the server to colorise rendered tiles.
+        All other fields are stored as-is and returned in GET /api/me.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KeySettings"
+            example:
+              palettes:
+                ndvi:
+                  - { v: 0.05,  rgba: [0, 0, 0, 0] }
+                  - { v: 0.051, rgba: [255, 0, 0, 255] }
+                  - { v: 0.3,   rgba: [255, 255, 0, 255] }
+                  - { v: 1.0,   rgba: [0, 100, 0, 255] }
+      responses:
+        "200":
+          description: Updated settings returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settings:
+                    $ref: "#/components/schemas/KeySettings"
+        "400":
+          description: Invalid JSON or oversized body (>64 KB)
+        "401":
+          description: Missing or invalid API key
+
+  # ── Admin ────────────────────────────────────────────────────────────────────
+
+  /api/admin/keys:
+    post:
+      tags: [Admin]
+      summary: Create a new API key
+      description: |
+        Generates a cryptographically random 32-byte token (base64url-encoded, 43 chars)
+        and stores it as an active API key with the given label.
+      security:
+        - AdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  description: Human-readable name for this key
+                  example: "frontend-prod"
+      responses:
+        "201":
+          description: Created API key (token shown once — store it)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKey"
+        "401":
+          description: Missing or invalid X-Admin-Token
+        "500":
+          description: Failed to generate token or persist to database
+        "503":
+          description: Admin endpoints not configured (ADMIN_TOKEN env var not set)
+
+    get:
+      tags: [Admin]
+      summary: List all API keys
+      description: Returns all API keys (active and inactive) ordered by creation date descending. Tokens are included in full.
+      security:
+        - AdminToken: []
+      responses:
+        "200":
+          description: Array of API keys
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/APIKey"
+        "401":
+          description: Missing or invalid X-Admin-Token
+        "503":
+          description: Admin endpoints not configured
+
+  /api/admin/keys/{token}:
+    delete:
+      tags: [Admin]
+      summary: Deactivate an API key
+      description: |
+        Sets `is_active = false` for the given token. The key is immediately rejected
+        by the auth middleware (Redis cache is invalidated). The record is kept in the
+        database for auditing.
+      security:
+        - AdminToken: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Full token string of the key to deactivate
+          schema:
+            type: string
+          example: "vQhKLJmuubLViKxS_Wlt1BFkNneJdsTDvTAQu6uQvmc"
+      responses:
+        "200":
+          description: Key deactivated
+        "401":
+          description: Missing or invalid X-Admin-Token
+        "404":
+          description: Token not found or already inactive
+        "503":
+          description: Admin endpoints not configured
+
+  # ── System ───────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      tags: [System]
+      summary: Health check
+      description: Returns `ok` when the server is running. Used by Docker Compose and Nginx upstream checks. No authentication required.
+      security: []
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "ok"
+
+  /openapi.yaml:
+    get:
+      tags: [System]
+      summary: OpenAPI specification
+      description: Returns this specification file. No authentication required.
+      security: []
+      responses:
+        "200":
+          description: OpenAPI 3.0 YAML
+          content:
+            text/yaml:
+              schema:
+                type: string
+
+  /swagger/:
+    get:
+      tags: [System]
+      summary: Swagger UI
+      description: Interactive API documentation. No authentication required.
+      security: []
+      responses:
+        "200":
+          description: HTML page with Swagger UI
+          content:
+            text/html:
+              schema:
+                type: string

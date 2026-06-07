@@ -85,12 +85,28 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 	}
 	polygonHash := geo.PolygonHash(polygon)
 
+	// Capture the palette at job-creation time so all tiles in the job share
+	// one consistent palette even if the token settings change mid-run.
+	// Each index gets its own palette; we derive a single paletteHash from the
+	// first index since all tiles for a job share one set of settings.
+	firstIndex := indexes[0]
+	jobPalettes := make(map[string][]render.PaletteStop, len(indexes))
+	var paletteHash string
+	apiKey := APIKeyFromContext(r.Context())
+	for _, ix := range indexes {
+		stops, h := paletteForIndex(apiKey, ix)
+		jobPalettes[ix] = stops
+		if ix == firstIndex {
+			paletteHash = h
+		}
+	}
+
 	jobID := uuid.New().String()
 	ctx := r.Context()
 
 	if err := rh.store.CreateJob(ctx, jobID, bbox,
 		req.StartDate, req.EndDate, req.MaxCloudCover,
-		req.W, req.H, polygonHash, req.Polygon, indexes,
+		req.W, req.H, polygonHash, paletteHash, req.Polygon, indexes,
 	); err != nil {
 		http.Error(w, "failed to create job", http.StatusInternalServerError)
 		log.Printf("[job] create job: %v", err)
@@ -98,7 +114,7 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 	}
 
 	go rh.runJob(jobID, bbox, req.StartDate, req.EndDate, req.MaxCloudCover,
-		req.W, req.H, polygon, polygonHash, indexes)
+		req.W, req.H, polygon, polygonHash, paletteHash, jobPalettes, indexes)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -180,6 +196,8 @@ func (rh *RenderHandler) runJob(
 	w, h int,
 	polygon []geo.LngLat,
 	polygonHash string,
+	paletteHash string,
+	palettes map[string][]render.PaletteStop,
 	indexes []string,
 ) {
 	ctx := context.Background()
@@ -227,7 +245,7 @@ func (rh *RenderHandler) runJob(
 			index := index
 
 			// Skip if already cached.
-			if _, found, _ := rh.store.Lookup(ctx, bbox, scene.Date, index, w, h, polygonHash); found {
+			if _, found, _ := rh.store.Lookup(ctx, bbox, scene.Date, index, w, h, polygonHash, paletteHash); found {
 				log.Printf("[job] %s: skip %s/%s (cached)", jobID, scene.Date, index)
 				_ = rh.store.IncrJobDone(ctx, jobID)
 				continue
@@ -245,6 +263,7 @@ func (rh *RenderHandler) runJob(
 					W:       w,
 					H:       h,
 					Polygon: polygon,
+					Palette: palettes[index],
 				}
 				result, renderErr := render.RenderFromBands(ctx, scene.Bands, params)
 				if renderErr != nil {
@@ -256,7 +275,7 @@ func (rh *RenderHandler) runJob(
 					if result.Stats != nil {
 						statsJSON, _ = json.Marshal(result.Stats)
 					}
-					if saveErr := rh.store.Save(ctx, bbox, scene.Date, index, w, h, result.PNG, result.RawValues, polygonHash, statsJSON, scene.CloudCover); saveErr != nil {
+					if saveErr := rh.store.Save(ctx, bbox, scene.Date, index, w, h, result.PNG, result.RawValues, polygonHash, paletteHash, statsJSON, scene.CloudCover); saveErr != nil {
 						msg := fmt.Sprintf("%s/%s: save: %v", scene.Date, index, saveErr)
 						log.Printf("[job] %s: %s", jobID, msg)
 						_ = rh.store.AppendJobError(ctx, jobID, msg)
