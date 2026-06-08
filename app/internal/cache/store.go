@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -153,12 +154,12 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 // (may be nil). cloud is the scene-level cloud cover fraction (0–100). Errors
 // are logged but not returned to the caller so that the HTTP response is not
 // blocked.
-func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash, paletteHash string, statsJSON []byte, cloud float64) {
+func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash, tokenPrefix, paletteHash string, statsJSON []byte, cloud float64) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		key := BuildKey(bbox, date, indexType, w, h, polygonHash, paletteHash)
+		key := BuildKey(tokenPrefix, bbox, date, indexType, w, h, polygonHash, paletteHash)
 
 		_, err := s.minio.PutObject(ctx, s.bucket, key,
 			bytes.NewReader(pngBytes), int64(len(pngBytes)),
@@ -289,8 +290,8 @@ func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
 //
 // statsJSON is the JSON-encoded render.TileStats (nil when not applicable, e.g.
 // for TCI). cloud is the scene-level cloud cover percentage.
-func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash, paletteHash string, statsJSON []byte, cloud float64) error {
-	key := BuildKey(bbox, date, indexType, w, h, polygonHash, paletteHash)
+func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash, tokenPrefix, paletteHash string, statsJSON []byte, cloud float64) error {
+	key := BuildKey(tokenPrefix, bbox, date, indexType, w, h, polygonHash, paletteHash)
 
 	_, err := s.minio.PutObject(ctx, s.bucket, key,
 		bytes.NewReader(pngBytes), int64(len(pngBytes)),
@@ -781,7 +782,35 @@ func (s *Store) TouchAPIKeyLastUsed(ctx context.Context, token string) {
 // If polygonHash is non-empty it is appended to the filename, distinguishing
 // polygon-masked tiles from the plain tile with the same bbox/date/dimensions.
 // Exported so workers can construct the result URL before SaveAsync completes.
-func BuildKey(bbox geo.BBox, date, indexType string, w, h int, polygonHash, paletteHash string) string {
+// TokenPrefix returns the MinIO path prefix for a given API key as
+// "<id>-<sanitized-label>/". This keeps each token's tiles in a distinct
+// folder that is both unique (id) and human-readable (label) in the MinIO
+// browser. Returns "" when id <= 0 (anonymous / legacy tiles).
+func TokenPrefix(id int64, label string) string {
+	if id <= 0 {
+		return ""
+	}
+	sanitized := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + 32 // toLower
+		default:
+			return '-'
+		}
+	}, label)
+	sanitized = strings.Trim(sanitized, "-")
+	if len(sanitized) > 30 {
+		sanitized = sanitized[:30]
+	}
+	if sanitized == "" {
+		return fmt.Sprintf("%d/", id)
+	}
+	return fmt.Sprintf("%d-%s/", id, sanitized)
+}
+
+func BuildKey(tokenPrefix string, bbox geo.BBox, date, indexType string, w, h int, polygonHash, paletteHash string) string {
 	suffix := ""
 	if polygonHash != "" {
 		suffix += "_" + polygonHash
@@ -789,7 +818,7 @@ func BuildKey(bbox geo.BBox, date, indexType string, w, h int, polygonHash, pale
 	if paletteHash != "" {
 		suffix += "_p" + paletteHash
 	}
-	return fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d%s.png",
+	return tokenPrefix + fmt.Sprintf("%s/%s/%.6f_%.6f_%.6f_%.6f_%dx%d%s.png",
 		indexType, date,
 		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
 		w, h, suffix,

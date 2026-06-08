@@ -93,6 +93,7 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 	jobPalettes := make(map[string][]render.PaletteStop, len(indexes))
 	var paletteHash string
 	apiKey := APIKeyFromContext(r.Context())
+	tokenPrefix := tokenPrefixFor(apiKey)
 	for _, ix := range indexes {
 		stops, h := paletteForIndex(apiKey, ix)
 		jobPalettes[ix] = stops
@@ -114,7 +115,7 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 	}
 
 	go rh.runJob(jobID, bbox, req.StartDate, req.EndDate, req.MaxCloudCover,
-		req.W, req.H, polygon, polygonHash, paletteHash, jobPalettes, indexes)
+		req.W, req.H, polygon, polygonHash, tokenPrefix, paletteHash, jobPalettes, indexes)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -196,6 +197,7 @@ func (rh *RenderHandler) runJob(
 	w, h int,
 	polygon []geo.LngLat,
 	polygonHash string,
+	tokenPrefix string,
 	paletteHash string,
 	palettes map[string][]render.PaletteStop,
 	indexes []string,
@@ -275,7 +277,7 @@ func (rh *RenderHandler) runJob(
 					if result.Stats != nil {
 						statsJSON, _ = json.Marshal(result.Stats)
 					}
-					if saveErr := rh.store.Save(ctx, bbox, scene.Date, index, w, h, result.PNG, result.RawValues, polygonHash, paletteHash, statsJSON, scene.CloudCover); saveErr != nil {
+					if saveErr := rh.store.Save(ctx, bbox, scene.Date, index, w, h, result.PNG, result.RawValues, polygonHash, tokenPrefix, paletteHash, statsJSON, scene.CloudCover); saveErr != nil {
 						msg := fmt.Sprintf("%s/%s: save: %v", scene.Date, index, saveErr)
 						log.Printf("[job] %s: %s", jobID, msg)
 						_ = rh.store.AppendJobError(ctx, jobID, msg)

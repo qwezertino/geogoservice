@@ -153,7 +153,9 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 		polygon[i] = geo.LngLat{pt[0], pt[1]}
 	}
 	polygonHash := geo.PolygonHash(polygon)
-	palette, paletteHash := paletteForIndex(APIKeyFromContext(ctx), req.Index)
+	apiKey := APIKeyFromContext(ctx)
+	palette, paletteHash := paletteForIndex(apiKey, req.Index)
+	tokenPrefix := tokenPrefixFor(apiKey)
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────
 	hit, found, err := rh.store.Lookup(ctx, bbox, req.Date, req.Index, req.W, req.H, polygonHash, paletteHash)
@@ -198,7 +200,7 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	if res.Stats != nil {
 		statsJSON, _ = json.Marshal(res.Stats)
 	}
-	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, res.PNG, polygonHash, paletteHash, statsJSON, 0)
+	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, res.PNG, polygonHash, tokenPrefix, paletteHash, statsJSON, 0)
 
 	return BatchResult{
 		Index: idx,

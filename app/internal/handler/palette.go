@@ -7,6 +7,15 @@ import (
 	"github.com/qwezert/geogoservice/internal/render"
 )
 
+// tokenPrefixFor returns the MinIO path prefix for the given API key as
+// "<id>-<sanitized-label>/". Returns "" for nil key (pre-auth / legacy tiles).
+func tokenPrefixFor(key *cache.APIKey) string {
+	if key == nil {
+		return ""
+	}
+	return cache.TokenPrefix(key.ID, key.Label)
+}
+
 // paletteForIndex returns the palette stops and cache hash for the given index
 // from the API key's settings. Falls back to render.DefaultPalette(index) with
 // hash "" when no custom palette is configured (preserving existing cache keys).

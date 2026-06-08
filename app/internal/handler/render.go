@@ -92,8 +92,10 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	apiKey := APIKeyFromContext(ctx)
 	polygonHash := geo.PolygonHash(params.polygon)
-	palette, paletteHash := paletteForIndex(APIKeyFromContext(ctx), params.index)
+	palette, paletteHash := paletteForIndex(apiKey, params.index)
+	tokenPrefix := tokenPrefixFor(apiKey)
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────
 	if !params.noCache {
@@ -118,7 +120,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	// ── 2. Singleflight: deduplicate concurrent renders for the same tile ────────
 	// If N requests arrive for the same bbox/date/index/size simultaneously,
 	// only one GDAL render runs — all others share the result.
-	sfKey := cache.BuildKey(params.bbox3857, params.date, params.index, params.w, params.h, polygonHash, paletteHash)
+	sfKey := cache.BuildKey(tokenPrefix, params.bbox3857, params.date, params.index, params.w, params.h, polygonHash, paletteHash)
 	type result struct {
 		png []byte
 		err error
@@ -153,7 +155,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 		if res.Stats != nil {
 			statsJSON, _ = json.Marshal(res.Stats)
 		}
-		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, res.PNG, polygonHash, paletteHash, statsJSON, 0)
+		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, res.PNG, polygonHash, tokenPrefix, paletteHash, statsJSON, 0)
 		return result{png: res.PNG}, nil
 	})
 	if err != nil {
