@@ -162,13 +162,8 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	if err == nil && found {
 		pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
 		if err == nil {
-			return BatchResult{
-				Index:  idx,
-				Data:   base64.StdEncoding.EncodeToString(pngBytes),
-				Cached: true,
-			}
+			return BatchResult{Index: idx, Data: base64.StdEncoding.EncodeToString(pngBytes), Cached: true}
 		}
-		// Cache inconsistency — fall through to render.
 		fmt.Printf("[batch] minio get failed for idx %d, re-rendering: %v\n", idx, err)
 	}
 
@@ -200,7 +195,7 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	if res.Stats != nil {
 		statsJSON, _ = json.Marshal(res.Stats)
 	}
-	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, res.PNG, polygonHash, tokenPrefix, paletteHash, statsJSON, 0)
+	rh.store.SaveAsync(bbox, req.Date, req.Index, req.W, req.H, res.PNG, res.RawValues, polygonHash, tokenPrefix, paletteHash, statsJSON, 0)
 
 	return BatchResult{
 		Index: idx,

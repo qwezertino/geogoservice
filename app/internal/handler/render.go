@@ -108,7 +108,6 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 		if found {
 			pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
 			if err != nil {
-				// Cache inconsistency – fall through and recompute
 				fmt.Printf("[handler] minio get failed, recomputing: %v\n", err)
 			} else {
 				writePNG(w, pngBytes)
@@ -118,15 +117,9 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── 2. Singleflight: deduplicate concurrent renders for the same tile ────────
-	// If N requests arrive for the same bbox/date/index/size simultaneously,
-	// only one GDAL render runs — all others share the result.
 	sfKey := cache.BuildKey(tokenPrefix, params.bbox3857, params.date, params.index, params.w, params.h, polygonHash, paletteHash)
-	type result struct {
-		png []byte
-		err error
-	}
+	type result struct{ png []byte }
 	v, err, _ := rh.sf.Do(sfKey, func() (any, error) {
-		// ── 2a. Acquire render slot inside the singleflight func ─────────────
 		select {
 		case rh.sem <- struct{}{}:
 			defer func() { <-rh.sem }()
@@ -134,7 +127,6 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 			return nil, ctx.Err()
 		}
 
-		// ── 2b. Full render pipeline ─────────────────────────────────────────
 		res, renderErr := render.RenderTile(ctx, render.TileParams{
 			BBox:             params.bbox3857,
 			Date:             params.date,
@@ -150,12 +142,11 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 			return nil, renderErr
 		}
 
-		// Save to cache — only once, not for every waiting goroutine.
 		var statsJSON []byte
 		if res.Stats != nil {
 			statsJSON, _ = json.Marshal(res.Stats)
 		}
-		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, res.PNG, polygonHash, tokenPrefix, paletteHash, statsJSON, 0)
+		rh.store.SaveAsync(params.bbox3857, params.date, params.index, params.w, params.h, res.PNG, res.RawValues, polygonHash, tokenPrefix, paletteHash, statsJSON, 0)
 		return result{png: res.PNG}, nil
 	})
 	if err != nil {
@@ -167,10 +158,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	pngBytes := v.(result).png
-
-	// ── 3. Return PNG ────────────────────────────────────────────────────────
-	writePNG(w, pngBytes)
+	writePNG(w, v.(result).png)
 }
 
 func writePNG(w http.ResponseWriter, data []byte) {

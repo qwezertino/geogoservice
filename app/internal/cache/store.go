@@ -80,7 +80,9 @@ type LookupResult struct {
 
 // Lookup checks whether a tile for the given parameters already exists in the
 // cache. polygonHash is "" for plain tiles and an 8-char hex string for
-// polygon-masked tiles. Returns (result, true, nil) on a hit, (nil, false, nil)
+// polygon-masked tiles. paletteHash is "" for the default palette or an 8-char
+// hex string when a custom palette was used — different palettes produce
+// different cached PNGs. Returns (result, true, nil) on a hit, (nil, false, nil)
 // on a miss, or (nil, false, err) on a database error.
 func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexType string, w, h int, polygonHash, paletteHash string) (*LookupResult, bool, error) {
 	const q = `
@@ -154,7 +156,7 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 // (may be nil). cloud is the scene-level cloud cover fraction (0–100). Errors
 // are logged but not returned to the caller so that the HTTP response is not
 // blocked.
-func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, polygonHash, tokenPrefix, paletteHash string, statsJSON []byte, cloud float64) {
+func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash, tokenPrefix, paletteHash string, statsJSON []byte, cloud float64) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -174,6 +176,22 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 		if s.rdb != nil {
 			if err := s.rdb.Set(ctx, key, pngBytes, redisTTL).Err(); err != nil {
 				fmt.Printf("[cache] redis set error key=%s: %v\n", key, err)
+			}
+		}
+
+		// Store companion raw float32 binary so re-colourisation from raw is
+		// possible without a full GDAL re-render.
+		if len(ndviRaw) > 0 {
+			rawKey := NDVIRawKey(key)
+			rawBuf := make([]byte, len(ndviRaw)*4)
+			for i, v := range ndviRaw {
+				binary.LittleEndian.PutUint32(rawBuf[i*4:], math.Float32bits(v))
+			}
+			if _, putErr := s.minio.PutObject(ctx, s.bucket, rawKey,
+				bytes.NewReader(rawBuf), int64(len(rawBuf)),
+				minio.PutObjectOptions{ContentType: "application/octet-stream"},
+			); putErr != nil {
+				fmt.Printf("[cache] minio put raw %q: %v\n", rawKey, putErr)
 			}
 		}
 
@@ -255,12 +273,15 @@ func (s *Store) ListTilesByYear(ctx context.Context, year int, bbox [4]float64) 
 }
 
 // DeleteTile removes a tile from MinIO, PostgreSQL, and Redis (if enabled).
+// The companion .ndvi.bin raw object is also removed when present.
 // It is safe to call even if the tile does not exist in one of the stores.
 func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
-	// 1. MinIO
+	// 1. MinIO — PNG + companion raw binary.
 	if err := s.minio.RemoveObject(ctx, s.bucket, minioKey, minio.RemoveObjectOptions{}); err != nil {
 		return fmt.Errorf("minio remove %q: %w", minioKey, err)
 	}
+	// Best-effort removal of companion; non-fatal if absent.
+	_ = s.minio.RemoveObject(ctx, s.bucket, NDVIRawKey(minioKey), minio.RemoveObjectOptions{})
 
 	// 2. PostgreSQL
 	const del = `DELETE FROM tile_cache WHERE minio_key = $1`
@@ -350,6 +371,16 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 		return fmt.Errorf("db insert tile %q: %w", key, err)
 	}
 	return nil
+}
+
+// DecodeRawFloat32 converts a little-endian float32 byte slice (as stored by
+// Save/SaveAsync) back into a []float32 value buffer.
+func DecodeRawFloat32(b []byte) []float32 {
+	out := make([]float32, len(b)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return out
 }
 
 // NDVIRawKey returns the MinIO key for the companion float32 binary of a PNG tile.
@@ -645,6 +676,86 @@ func (s *Store) ListJobTilesWithStats(ctx context.Context, p *JobParams) ([]JobT
 	return results, rows.Err()
 }
 
+// AlternatePaletteTile is returned by FindAlternatePaletteTiles for each
+// cached tile that exists under a different palette but not yet under the
+// target palette. Used to re-colour tiles when a user changes their palette
+// without having to re-fetch satellite data.
+type AlternatePaletteTile struct {
+	Date        string
+	Index       string
+	OldMinioKey string
+	CloudCover  float64
+	Stats       json.RawMessage
+}
+
+// FindAlternatePaletteTiles returns tiles that exist in the cache under a
+// different paletteHash than targetPaletteHash, for which no tile with
+// targetPaletteHash already exists. Results are ordered by date/index.
+func (s *Store) FindAlternatePaletteTiles(
+	ctx context.Context,
+	bbox geo.BBox, w, h int, polygonHash string,
+	startDate, endDate string,
+	indexes []string,
+	targetPaletteHash string,
+) ([]AlternatePaletteTile, error) {
+	const q = `
+		SELECT tc.date_acquired::text, tc.index_type, tc.minio_key,
+		       COALESCE(tc.cloud, 0), tc.stats
+		FROM   tile_cache tc
+		WHERE  tc.bbox_3857_minx = $1 AND tc.bbox_3857_miny = $2
+		  AND  tc.bbox_3857_maxx = $3 AND tc.bbox_3857_maxy = $4
+		  AND  tc.width = $5 AND tc.height = $6
+		  AND  tc.polygon_hash = $7
+		  AND  tc.palette_hash != $8
+		  AND  tc.index_type = ANY($9)
+		  AND  tc.date_acquired BETWEEN $10::date AND $11::date
+		  AND  NOT EXISTS (
+		      SELECT 1 FROM tile_cache t2
+		      WHERE  t2.bbox_3857_minx = tc.bbox_3857_minx
+		        AND  t2.bbox_3857_miny = tc.bbox_3857_miny
+		        AND  t2.bbox_3857_maxx = tc.bbox_3857_maxx
+		        AND  t2.bbox_3857_maxy = tc.bbox_3857_maxy
+		        AND  t2.width = tc.width AND t2.height = tc.height
+		        AND  t2.polygon_hash = tc.polygon_hash
+		        AND  t2.palette_hash = $8
+		        AND  t2.index_type = tc.index_type
+		        AND  t2.date_acquired = tc.date_acquired
+		  )
+		ORDER BY tc.date_acquired, tc.index_type`
+
+	rows, err := s.db.Query(ctx, q,
+		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
+		w, h, polygonHash, targetPaletteHash,
+		indexes, startDate, endDate,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("find alternate palette tiles: %w", err)
+	}
+	defer rows.Close()
+
+	var results []AlternatePaletteTile
+	for rows.Next() {
+		var t AlternatePaletteTile
+		var statsRaw []byte
+		if err := rows.Scan(&t.Date, &t.Index, &t.OldMinioKey, &t.CloudCover, &statsRaw); err != nil {
+			return nil, fmt.Errorf("scan alternate palette tile: %w", err)
+		}
+		if len(statsRaw) > 0 {
+			t.Stats = json.RawMessage(statsRaw)
+		}
+		results = append(results, t)
+	}
+	return results, rows.Err()
+}
+
+// AddJobTotal increments the job's total tile count. Used when additional
+// repalette tiles are discovered after the initial STAC search.
+func (s *Store) AddJobTotal(ctx context.Context, id string, delta int) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE render_jobs SET total = total + $2 WHERE id = $1`, id, delta)
+	return err
+}
+
 // ── API Key management ────────────────────────────────────────────────────────
 
 const redisAuthTTL = 5 * time.Minute
@@ -664,14 +775,22 @@ type APIKey struct {
 // CreateAPIKey inserts a new API key row and returns the full record.
 func (s *Store) CreateAPIKey(ctx context.Context, token, label string) (*APIKey, error) {
 	const q = `
-		INSERT INTO api_keys (token, label)
-		VALUES ($1, $2)
-		RETURNING id, token, label, settings, is_active, created_at, last_used_at`
+		WITH new_key AS (
+			INSERT INTO api_keys (token, label)
+			VALUES ($1, $2)
+			RETURNING id, token, label, is_active, created_at, last_used_at
+		),
+		_settings AS (
+			INSERT INTO api_key_settings (api_key_id)
+			SELECT id FROM new_key
+		)
+		SELECT id, token, label, is_active, created_at, last_used_at FROM new_key`
 	var k APIKey
 	row := s.db.QueryRow(ctx, q, token, label)
-	if err := row.Scan(&k.ID, &k.Token, &k.Label, &k.Settings, &k.IsActive, &k.CreatedAt, &k.LastUsedAt); err != nil {
+	if err := row.Scan(&k.ID, &k.Token, &k.Label, &k.IsActive, &k.CreatedAt, &k.LastUsedAt); err != nil {
 		return nil, fmt.Errorf("create api key: %w", err)
 	}
+	k.Settings = json.RawMessage("{}")
 	return &k, nil
 }
 
@@ -689,9 +808,10 @@ func (s *Store) GetAPIKeyByToken(ctx context.Context, token string) (*APIKey, er
 	}
 
 	const q = `
-		SELECT id, token, label, settings, is_active, created_at, last_used_at
-		FROM api_keys
-		WHERE token = $1 AND is_active = TRUE
+		SELECT k.id, k.token, k.label, COALESCE(s.settings, '{}'), k.is_active, k.created_at, k.last_used_at
+		FROM api_keys k
+		LEFT JOIN api_key_settings s ON s.api_key_id = k.id
+		WHERE k.token = $1 AND k.is_active = TRUE
 		LIMIT 1`
 	var k APIKey
 	row := s.db.QueryRow(ctx, q, token)
@@ -713,9 +833,10 @@ func (s *Store) GetAPIKeyByToken(ctx context.Context, token string) (*APIKey, er
 // ListAPIKeys returns all api_keys rows ordered by created_at DESC.
 func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
 	const q = `
-		SELECT id, token, label, settings, is_active, created_at, last_used_at
-		FROM api_keys
-		ORDER BY created_at DESC`
+		SELECT k.id, k.token, k.label, COALESCE(s.settings, '{}'), k.is_active, k.created_at, k.last_used_at
+		FROM api_keys k
+		LEFT JOIN api_key_settings s ON s.api_key_id = k.id
+		ORDER BY k.created_at DESC`
 	rows, err := s.db.Query(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("list api keys: %w", err)
@@ -751,8 +872,12 @@ func (s *Store) DeactivateAPIKey(ctx context.Context, token string) error {
 }
 
 // UpdateAPIKeySettings replaces the settings JSONB for the key identified by token.
+// Uses upsert so settings rows are created on demand even for legacy keys without one.
 func (s *Store) UpdateAPIKeySettings(ctx context.Context, token string, settings json.RawMessage) error {
-	const q = `UPDATE api_keys SET settings = $2::jsonb WHERE token = $1 AND is_active = TRUE`
+	const q = `
+		INSERT INTO api_key_settings (api_key_id, settings)
+		SELECT id, $2::jsonb FROM api_keys WHERE token = $1 AND is_active = TRUE
+		ON CONFLICT (api_key_id) DO UPDATE SET settings = EXCLUDED.settings`
 	tag, err := s.db.Exec(ctx, q, token, settings)
 	if err != nil {
 		return fmt.Errorf("update api key settings: %w", err)

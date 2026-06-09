@@ -114,6 +114,10 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	log.Printf("[job] %s: created bbox=[%.0f,%.0f,%.0f,%.0f] dates=%s/%s cloud=%.0f%% size=%dx%d indexes=%v",
+		jobID, bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
+		req.StartDate, req.EndDate, req.MaxCloudCover, req.W, req.H, indexes)
+
 	go rh.runJob(jobID, bbox, req.StartDate, req.EndDate, req.MaxCloudCover,
 		req.W, req.H, polygon, polygonHash, tokenPrefix, paletteHash, jobPalettes, indexes)
 
@@ -216,11 +220,19 @@ func (rh *RenderHandler) runJob(
 		return
 	}
 
-	total := len(scenes) * len(indexes)
+	// Find tiles stored under a different paletteHash — they need recolouring.
+	alternateTiles, altErr := rh.store.FindAlternatePaletteTiles(ctx,
+		bbox, w, h, polygonHash, startDate, endDate, indexes, paletteHash)
+	if altErr != nil {
+		log.Printf("[job] %s: FindAlternatePaletteTiles: %v", jobID, altErr)
+	}
+
+	total := len(scenes)*len(indexes) + len(alternateTiles)
 	if err := rh.store.SetJobRunning(ctx, jobID, total); err != nil {
 		log.Printf("[job] %s: SetJobRunning: %v", jobID, err)
 	}
-	log.Printf("[job] %s: found %d scenes × %d indexes = %d tiles", jobID, len(scenes), len(indexes), total)
+	log.Printf("[job] %s: found %d scenes × %d indexes = %d tiles, %d repalette",
+		jobID, len(scenes), len(indexes), len(scenes)*len(indexes), len(alternateTiles))
 
 	var wg sync.WaitGroup
 	for _, scene := range scenes {
@@ -267,7 +279,18 @@ func (rh *RenderHandler) runJob(
 					Polygon: polygon,
 					Palette: palettes[index],
 				}
-				result, renderErr := render.RenderFromBands(ctx, scene.Bands, params)
+				const maxRenderAttempts = 3
+				var result *render.RenderResult
+				var renderErr error
+				for attempt := range maxRenderAttempts {
+					result, renderErr = render.RenderFromBands(ctx, scene.Bands, params)
+					if renderErr == nil {
+						break
+					}
+					if attempt < maxRenderAttempts-1 {
+						log.Printf("[job] %s: %s/%s: attempt %d failed, retrying: %v", jobID, scene.Date, index, attempt+1, renderErr)
+					}
+				}
 				if renderErr != nil {
 					msg := fmt.Sprintf("%s/%s: %v", scene.Date, index, renderErr)
 					log.Printf("[job] %s: render failed: %s", jobID, msg)
@@ -289,6 +312,42 @@ func (rh *RenderHandler) runJob(
 	}
 
 	wg.Wait()
+
+	// Recolour tiles that have raw values stored under an old paletteHash.
+	var pixelPoly [][2]float64
+	if len(polygon) >= 3 {
+		pixelPoly = geo.PolygonToPixels(polygon, bbox, w, h)
+	}
+	for _, alt := range alternateTiles {
+		rawBytes, err := rh.store.GetNDVIRaw(ctx, alt.OldMinioKey)
+		if err != nil {
+			log.Printf("[job] %s: repalette %s/%s: get raw: %v (skip)", jobID, alt.Date, alt.Index, err)
+			_ = rh.store.IncrJobDone(ctx, jobID)
+			continue
+		}
+		vals := cache.DecodeRawFloat32(rawBytes)
+
+		pngBytes, err := render.RenderIndexPNG(vals, alt.Index, w, h, pixelPoly, palettes[alt.Index])
+		if err != nil {
+			log.Printf("[job] %s: repalette %s/%s: render: %v (skip)", jobID, alt.Date, alt.Index, err)
+			_ = rh.store.IncrJobDone(ctx, jobID)
+			continue
+		}
+
+		if saveErr := rh.store.Save(ctx, bbox, alt.Date, alt.Index, w, h,
+			pngBytes, vals, polygonHash, tokenPrefix, paletteHash,
+			[]byte(alt.Stats), alt.CloudCover,
+		); saveErr != nil {
+			log.Printf("[job] %s: repalette %s/%s: save: %v", jobID, alt.Date, alt.Index, saveErr)
+		} else {
+			if delErr := rh.store.DeleteTile(ctx, alt.OldMinioKey); delErr != nil {
+				log.Printf("[job] %s: repalette %s/%s: delete old: %v", jobID, alt.Date, alt.Index, delErr)
+			}
+			log.Printf("[job] %s: repalette %s/%s: ok", jobID, alt.Date, alt.Index)
+		}
+		_ = rh.store.IncrJobDone(ctx, jobID)
+	}
+
 	if err := rh.store.SetJobDone(ctx, jobID); err != nil {
 		log.Printf("[job] %s: SetJobDone: %v", jobID, err)
 	}

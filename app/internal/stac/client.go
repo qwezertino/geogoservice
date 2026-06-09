@@ -23,8 +23,11 @@ const (
 	ProviderCDSE              = "cdse"
 )
 
-// Sentinel2Collection is the Sentinel-2 Level-2A collection ID used by all providers.
-const Sentinel2Collection = "sentinel-2-l2a"
+// Satellite collection IDs used across all providers.
+const (
+	Sentinel2Collection = "sentinel-2-l2a"
+	LandsatCollection   = "landsat-c2-l2"
+)
 
 // BandURLs holds the ready-to-use paths for the Sentinel-2 bands needed by
 // each spectral index, plus GDAL config options to open them.
@@ -271,6 +274,7 @@ type stacSearchResponse struct {
 // asset keys (e.g. "B04"/"B08" for PC vs "red"/"nir" for Earth Search).
 type stacRawFeature struct {
 	ID         string                `json:"id"`
+	Collection string                `json:"collection"`
 	Assets     map[string]*stacAsset `json:"assets"`
 	Properties struct {
 		Datetime   string  `json:"datetime"`
@@ -317,6 +321,7 @@ func findScenesInRangeHelper(
 	bbox geo.BBox,
 	startDate, endDate string,
 	maxCloud float64,
+	collections []string,
 	extractFn func(context.Context, stacRawFeature) (*BandURLs, error),
 ) ([]SceneInfo, error) {
 	datetime, err := buildDatetimeRange(startDate, endDate)
@@ -324,26 +329,28 @@ func findScenesInRangeHelper(
 		return nil, err
 	}
 
-	// One request for all scenes in the range. Sentinel-2 revisit = 5 days,
-	// so 3 months ≈ 18 dates × ~4 tiles per bbox = ~72 features max. 100 is safe.
+	// One request for all scenes in the range. With S2+Landsat combined,
+	// 3 months ≈ ~50 features — 200 is a safe upper limit.
 	features, err := doSearch(ctx, hc, baseURL, stacSearchRequest{
-		Collections: []string{Sentinel2Collection},
+		Collections: collections,
 		Datetime:    datetime,
 		BBox:        [4]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY},
 		Query: map[string]interface{}{
 			"eo:cloud_cover": map[string]interface{}{"lt": maxCloud},
 		},
 		SortBy: []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
-		Limit:  100,
+		Limit:  200,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Group by date: keep the feature with lowest cloud_cover per day.
+	// Group by date. Sentinel-2 beats Landsat for the same date (better resolution);
+	// within the same constellation, prefer lower cloud cover.
 	type bestFeature struct {
-		f  stacRawFeature
-		cc float64
+		f    stacRawFeature
+		cc   float64
+		isS2 bool
 	}
 	byDate := make(map[string]bestFeature, len(features))
 	for _, f := range features {
@@ -353,8 +360,15 @@ func findScenesInRangeHelper(
 		}
 		date := dt[:10]
 		cc := f.Properties.CloudCover
-		if existing, ok := byDate[date]; !ok || cc < existing.cc {
-			byDate[date] = bestFeature{f: f, cc: cc}
+		isS2 := f.Collection == Sentinel2Collection
+		existing, ok := byDate[date]
+		if !ok {
+			byDate[date] = bestFeature{f: f, cc: cc, isS2: isS2}
+			continue
+		}
+		// S2 always wins over Landsat; within same constellation pick lowest cloud.
+		if (!existing.isS2 && isS2) || (existing.isS2 == isS2 && cc < existing.cc) {
+			byDate[date] = bestFeature{f: f, cc: cc, isS2: isS2}
 		}
 	}
 

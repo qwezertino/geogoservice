@@ -82,6 +82,8 @@ func (p *cdseProvider) FindBestScene(
 		"AWS_VIRTUAL_HOSTING=FALSE",
 		"AWS_DEFAULT_REGION=" + cdseDefaultRegion,
 		"AWS_HTTPS=YES",
+		"GDAL_HTTP_MAX_RETRY=3",
+		"GDAL_HTTP_RETRY_DELAY=1",
 	}
 
 	bu := &BandURLs{
@@ -114,8 +116,10 @@ func (p *cdseProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, sta
 		"AWS_VIRTUAL_HOSTING=FALSE",
 		"AWS_DEFAULT_REGION=" + cdseDefaultRegion,
 		"AWS_HTTPS=YES",
+		"GDAL_HTTP_MAX_RETRY=3",
+		"GDAL_HTTP_RETRY_DELAY=1",
 	}
-	return findScenesInRangeHelper(ctx, p.hc, cdseSTACBaseURL, bbox, startDate, endDate, maxCloud,
+	return findScenesInRangeHelper(ctx, p.hc, cdseSTACBaseURL, bbox, startDate, endDate, maxCloud, []string{Sentinel2Collection},
 		func(_ context.Context, f stacRawFeature) (*BandURLs, error) {
 			b04 := f.Assets["B04_10m"]
 			b08 := f.Assets["B08_10m"]
