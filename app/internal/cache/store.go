@@ -756,6 +756,42 @@ func (s *Store) AddJobTotal(ctx context.Context, id string, delta int) error {
 	return err
 }
 
+// IsCacheComplete returns true when every date that has at least one tile
+// (with the given paletteHash, bbox, dimensions, polygon) has ALL requested
+// indexes present. Returns true for an empty cache — callers must check
+// ListJobTilesWithStats / FindAlternatePaletteTiles separately to decide
+// whether any cache exists at all.
+func (s *Store) IsCacheComplete(
+	ctx context.Context,
+	bbox geo.BBox, w, h int, polygonHash, paletteHash string,
+	startDate, endDate string,
+	indexes []string,
+) (bool, error) {
+	const q = `
+		SELECT COUNT(*) = 0
+		FROM (
+			SELECT date_acquired
+			FROM   tile_cache
+			WHERE  bbox_3857_minx = $1 AND bbox_3857_miny = $2
+			  AND  bbox_3857_maxx = $3 AND bbox_3857_maxy = $4
+			  AND  width = $5 AND height = $6
+			  AND  polygon_hash = $7
+			  AND  palette_hash = $8
+			  AND  index_type = ANY($9)
+			  AND  date_acquired BETWEEN $10::date AND $11::date
+			GROUP BY date_acquired
+			HAVING COUNT(DISTINCT index_type) < $12
+		) incomplete`
+
+	var complete bool
+	err := s.db.QueryRow(ctx, q,
+		bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY,
+		w, h, polygonHash, paletteHash,
+		indexes, startDate, endDate, len(indexes),
+	).Scan(&complete)
+	return complete, err
+}
+
 // ── API Key management ────────────────────────────────────────────────────────
 
 const redisAuthTTL = 5 * time.Minute

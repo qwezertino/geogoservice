@@ -14,6 +14,7 @@ import (
 	"github.com/qwezert/geogoservice/internal/cache"
 	"github.com/qwezert/geogoservice/internal/geo"
 	"github.com/qwezert/geogoservice/internal/render"
+	"github.com/qwezert/geogoservice/internal/stac"
 )
 
 // jobStatusResponse is the GET /api/jobs/{id} response.
@@ -214,25 +215,41 @@ func (rh *RenderHandler) runJob(
 		return
 	}
 
-	scenes, err := rh.stacClient.FindAllScenes(ctx, bbox4326, startDate, endDate, maxCloud)
-	if err != nil {
-		_ = rh.store.SetJobFailed(ctx, jobID, fmt.Sprintf("STAC search: %v", err))
-		return
+	// Pre-check cache before hitting external STAC providers.
+	// existingTiles: tiles already stored under the current paletteHash.
+	// alternateTiles: tiles stored under a different paletteHash → need recolouring.
+	jobParams := &cache.JobParams{
+		BBox: bbox, StartDate: startDate, EndDate: endDate,
+		W: w, H: h, PolygonHash: polygonHash, PaletteHash: paletteHash,
 	}
-
-	// Find tiles stored under a different paletteHash — they need recolouring.
+	existingTiles, _ := rh.store.ListJobTilesWithStats(ctx, jobParams)
 	alternateTiles, altErr := rh.store.FindAlternatePaletteTiles(ctx,
 		bbox, w, h, polygonHash, startDate, endDate, indexes, paletteHash)
 	if altErr != nil {
 		log.Printf("[job] %s: FindAlternatePaletteTiles: %v", jobID, altErr)
+	}
+	hasCache := len(existingTiles) > 0 || len(alternateTiles) > 0
+
+	// STAC search: each provider gets providerSearchTimeout independently
+	// (defined in the stac package). Failure is fatal only when there is no
+	// cached data to fall back on.
+	var scenes []stac.SceneInfo
+	scenes, err = rh.stacClient.FindAllScenes(ctx, bbox4326, startDate, endDate, maxCloud)
+	if err != nil {
+		if !hasCache {
+			_ = rh.store.SetJobFailed(ctx, jobID, fmt.Sprintf("STAC search: %v", err))
+			return
+		}
+		log.Printf("[job] %s: STAC failed (using cache): %v", jobID, err)
+		scenes = nil
 	}
 
 	total := len(scenes)*len(indexes) + len(alternateTiles)
 	if err := rh.store.SetJobRunning(ctx, jobID, total); err != nil {
 		log.Printf("[job] %s: SetJobRunning: %v", jobID, err)
 	}
-	log.Printf("[job] %s: found %d scenes × %d indexes = %d tiles, %d repalette",
-		jobID, len(scenes), len(indexes), len(scenes)*len(indexes), len(alternateTiles))
+	log.Printf("[job] %s: cache=%d existing+%d repalette, STAC=%d scenes × %d indexes",
+		jobID, len(existingTiles), len(alternateTiles), len(scenes), len(indexes))
 
 	var wg sync.WaitGroup
 	for _, scene := range scenes {

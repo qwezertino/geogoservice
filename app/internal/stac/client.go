@@ -222,10 +222,17 @@ func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, 
 	return nil, fmt.Errorf("all STAC providers failed; last error: %w", lastErr)
 }
 
+// providerSearchTimeout is the per-provider deadline for FindAllScenes.
+// Each provider gets this budget independently — a slow provider does not
+// eat into the budget of the next one.
+const providerSearchTimeout = 60 * time.Second
+
 // FindAllScenes issues a single STAC search across the full date range and
 // returns one SceneInfo per unique acquisition date (least-cloudy scene wins
 // when multiple scenes exist for the same date). The preferred provider is
 // tried first; on failure the others are tried in order.
+// Each provider gets its own providerSearchTimeout so a hanging provider
+// does not block the fallback chain.
 func (c *Client) FindAllScenes(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
 	providers := make([]Provider, 0)
 	if c.preferred != nil {
@@ -234,7 +241,9 @@ func (c *Client) FindAllScenes(ctx context.Context, bbox geo.BBox, startDate, en
 	providers = append(providers, c.others...)
 
 	for _, p := range providers {
-		scenes, err := p.FindScenesInRange(ctx, bbox, startDate, endDate, maxCloud)
+		pCtx, pCancel := context.WithTimeout(ctx, providerSearchTimeout)
+		scenes, err := p.FindScenesInRange(pCtx, bbox, startDate, endDate, maxCloud)
+		pCancel()
 		if err != nil {
 			fmt.Printf("[stac] FindAllScenes: provider %q failed: %v\n", p.Name(), err)
 			continue
@@ -329,17 +338,17 @@ func findScenesInRangeHelper(
 		return nil, err
 	}
 
-	// One request for all scenes in the range. With S2+Landsat combined,
-	// 3 months ≈ ~50 features — 200 is a safe upper limit.
+	// One request for all scenes in the range. We do not filter by cloud cover
+	// here because the STAC metadata reflects the full S2 tile (~110×110 km),
+	// not the user's (typically small) AOI. Per-AOI cloud checking is done later
+	// using the SCL band in the job runner. Sorting by cloud cover ascending still
+	// ensures the least-cloudy scene wins when multiple scenes share a date.
 	features, err := doSearch(ctx, hc, baseURL, stacSearchRequest{
 		Collections: collections,
 		Datetime:    datetime,
 		BBox:        [4]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY},
-		Query: map[string]interface{}{
-			"eo:cloud_cover": map[string]interface{}{"lt": maxCloud},
-		},
-		SortBy: []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
-		Limit:  200,
+		SortBy:      []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
+		Limit:       200,
 	})
 	if err != nil {
 		return nil, err

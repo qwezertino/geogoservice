@@ -22,7 +22,9 @@ const (
 )
 
 // pcCollections is the ordered list of STAC collections queried by PC.
-var pcCollections = []string{Sentinel2Collection, LandsatCollection}
+// Landsat is temporarily disabled pending AWS credential configuration.
+// Re-enable by adding LandsatCollection to this slice.
+var pcCollections = []string{Sentinel2Collection}
 
 // planetaryComputerProvider implements Provider for Microsoft Planetary Computer.
 // Caches per-collection SAS tokens so concurrent requests share a single token
@@ -55,11 +57,8 @@ func (p *planetaryComputerProvider) FindBestScene(ctx context.Context, bbox geo.
 		Collections: pcCollections,
 		Datetime:    datetime,
 		BBox:        [4]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY},
-		Query: map[string]interface{}{
-			"eo:cloud_cover": map[string]interface{}{"lt": maxCloud},
-		},
-		SortBy: []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
-		Limit:  20,
+		SortBy:      []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
+		Limit:       20,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("planetary computer search: %w", err)
