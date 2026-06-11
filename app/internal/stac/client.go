@@ -70,14 +70,13 @@ type SceneInfo struct {
 type Provider interface {
 	// Name returns the human-readable identifier used in logs.
 	Name() string
-	// FindBestScene returns COG URLs for the least-cloudy Sentinel-2 scene
-	// that intersects bbox (EPSG:4326) within ±windowDays of date,
-	// filtered to scenes with cloud cover below maxCloud.
-	FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error)
+	// FindBestScene returns COG URLs for the least-cloudy scene that intersects
+	// bbox (EPSG:4326) within ±windowDays of date.
+	FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int) (*BandURLs, error)
 	// FindScenesInRange returns one SceneInfo per unique acquisition date in
 	// [startDate, endDate], picking the least-cloudy scene per date.
 	// A single STAC /search request is issued — no per-date round trips.
-	FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error)
+	FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string) ([]SceneInfo, error)
 }
 
 // Client tries the preferred provider first. If that fails, it races all
@@ -137,7 +136,7 @@ func NewClient(preferredName string, httpClient *http.Client, cdseS3AccessKey, c
 
 // FindBestSceneFallback tries each remaining provider sequentially, skipping
 // the one that already failed at the band-read stage. Order: PC → EarthSearch → CDSE.
-func (c *Client) FindBestSceneFallback(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64, skipProvider string) (*BandURLs, error) {
+func (c *Client) FindBestSceneFallback(ctx context.Context, bbox geo.BBox, date string, windowDays int, skipProvider string) (*BandURLs, error) {
 	var pool []Provider
 	if c.preferred != nil && c.preferred.Name() != skipProvider {
 		pool = append(pool, c.preferred)
@@ -152,7 +151,7 @@ func (c *Client) FindBestSceneFallback(ctx context.Context, bbox geo.BBox, date 
 	}
 	var lastErr error
 	for _, p := range pool {
-		b, err := p.FindBestScene(ctx, bbox, date, windowDays, maxCloud)
+		b, err := p.FindBestScene(ctx, bbox, date, windowDays)
 		if err == nil {
 			fmt.Printf("[stac] fallback provider %q succeeded\n", p.Name())
 			b.ProviderName = p.Name()
@@ -167,7 +166,7 @@ func (c *Client) FindBestSceneFallback(ctx context.Context, bbox geo.BBox, date 
 // raceProviders starts FindBestScene on all providers in parallel and returns
 // the first successful result. Available for future use if low-latency matters
 // more than cost — currently unused in favour of sequential fallback.
-func raceProviders(ctx context.Context, pool []Provider, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
+func raceProviders(ctx context.Context, pool []Provider, bbox geo.BBox, date string, windowDays int) (*BandURLs, error) {
 	type result struct {
 		bands    *BandURLs
 		err      error
@@ -179,7 +178,7 @@ func raceProviders(ctx context.Context, pool []Provider, bbox geo.BBox, date str
 	for _, p := range pool {
 		p := p
 		go func() {
-			b, err := p.FindBestScene(raceCtx, bbox, date, windowDays, maxCloud)
+			b, err := p.FindBestScene(raceCtx, bbox, date, windowDays)
 			ch <- result{bands: b, err: err, provider: p.Name()}
 		}()
 	}
@@ -201,7 +200,7 @@ func raceProviders(ctx context.Context, pool []Provider, bbox geo.BBox, date str
 // FindBestScene tries providers sequentially: PC → EarthSearch → CDSE.
 // Each provider is tried only after the previous one fails, avoiding
 // unnecessary parallel requests to slower sources.
-func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
+func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int) (*BandURLs, error) {
 	var all []Provider
 	if c.preferred != nil {
 		all = append(all, c.preferred)
@@ -210,7 +209,7 @@ func (c *Client) FindBestScene(ctx context.Context, bbox geo.BBox, date string, 
 
 	var lastErr error
 	for _, p := range all {
-		bands, err := p.FindBestScene(ctx, bbox, date, windowDays, maxCloud)
+		bands, err := p.FindBestScene(ctx, bbox, date, windowDays)
 		if err == nil {
 			fmt.Printf("[stac] provider %q succeeded\n", p.Name())
 			bands.ProviderName = p.Name()
@@ -233,7 +232,7 @@ const providerSearchTimeout = 60 * time.Second
 // tried first; on failure the others are tried in order.
 // Each provider gets its own providerSearchTimeout so a hanging provider
 // does not block the fallback chain.
-func (c *Client) FindAllScenes(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
+func (c *Client) FindAllScenes(ctx context.Context, bbox geo.BBox, startDate, endDate string) ([]SceneInfo, error) {
 	providers := make([]Provider, 0)
 	if c.preferred != nil {
 		providers = append(providers, c.preferred)
@@ -242,7 +241,7 @@ func (c *Client) FindAllScenes(ctx context.Context, bbox geo.BBox, startDate, en
 
 	for _, p := range providers {
 		pCtx, pCancel := context.WithTimeout(ctx, providerSearchTimeout)
-		scenes, err := p.FindScenesInRange(pCtx, bbox, startDate, endDate, maxCloud)
+		scenes, err := p.FindScenesInRange(pCtx, bbox, startDate, endDate)
 		pCancel()
 		if err != nil {
 			fmt.Printf("[stac] FindAllScenes: provider %q failed: %v\n", p.Name(), err)
@@ -329,7 +328,6 @@ func findScenesInRangeHelper(
 	baseURL string,
 	bbox geo.BBox,
 	startDate, endDate string,
-	maxCloud float64,
 	collections []string,
 	extractFn func(context.Context, stacRawFeature) (*BandURLs, error),
 ) ([]SceneInfo, error) {
@@ -400,7 +398,7 @@ func findScenesInRangeHelper(
 	}
 
 	if len(scenes) == 0 {
-		return nil, fmt.Errorf("no usable scenes in %s/%s (cloud<%.0f%%)", startDate, endDate, maxCloud)
+		return nil, fmt.Errorf("no usable scenes found in %s/%s", startDate, endDate)
 	}
 	return scenes, nil
 }

@@ -71,7 +71,7 @@ func (rh *RenderHandler) ServeNDVIRaw(w http.ResponseWriter, r *http.Request) {
 
 	// STAC search: find the same scene used when the tile was originally rendered.
 	bands, err := rh.stacClient.FindBestScene(ctx, bbox4326, rec.Date,
-		rh.defaultSearchWindowDays, rh.defaultMaxCloudCover)
+		rh.defaultSearchWindowDays)
 	if err != nil {
 		http.Error(w, "STAC search failed: "+err.Error(), http.StatusBadGateway)
 		fmt.Printf("[ndvi-raw] STAC search for key=%q: %v\n", key, err)

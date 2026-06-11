@@ -46,7 +46,7 @@ func newEarthSearchProvider(hc *http.Client) *earthSearchProvider {
 
 func (p *earthSearchProvider) Name() string { return ProviderEarthSearch }
 
-func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
+func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int) (*BandURLs, error) {
 	datetime, err := buildDatetimeInterval(date, windowDays)
 	if err != nil {
 		return nil, err
@@ -77,8 +77,8 @@ func (p *earthSearchProvider) FindBestScene(ctx context.Context, bbox geo.BBox, 
 
 // FindScenesInRange returns one SceneInfo per unique acquisition date in
 // [startDate, endDate], combining Sentinel-2 and Landsat scenes.
-func (p *earthSearchProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
-	return findScenesInRangeHelper(ctx, p.hc, esBaseURL, bbox, startDate, endDate, maxCloud, esCollections,
+func (p *earthSearchProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string) ([]SceneInfo, error) {
+	return findScenesInRangeHelper(ctx, p.hc, esBaseURL, bbox, startDate, endDate, esCollections,
 		func(_ context.Context, f stacRawFeature) (*BandURLs, error) {
 			return esExtractBands(f)
 		})

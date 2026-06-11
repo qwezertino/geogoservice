@@ -37,13 +37,7 @@ func newCDSEProvider(hc *http.Client, s3AccessKey, s3SecretKey string) *cdseProv
 
 func (p *cdseProvider) Name() string { return ProviderCDSE }
 
-func (p *cdseProvider) FindBestScene(
-	ctx context.Context,
-	bbox geo.BBox,
-	date string,
-	windowDays int,
-	maxCloud float64,
-) (*BandURLs, error) {
+func (p *cdseProvider) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int) (*BandURLs, error) {
 	datetime, err := buildDatetimeInterval(date, windowDays)
 	if err != nil {
 		return nil, err
@@ -54,11 +48,8 @@ func (p *cdseProvider) FindBestScene(
 		Collections: []string{Sentinel2Collection},
 		Datetime:    datetime,
 		BBox:        [4]float64{bbox.MinX, bbox.MinY, bbox.MaxX, bbox.MaxY},
-		Query: map[string]interface{}{
-			"eo:cloud_cover": map[string]interface{}{"lt": maxCloud},
-		},
-		SortBy: []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
-		Limit:  20,
+		SortBy:      []stacSortBy{{Field: "properties.eo:cloud_cover", Direction: "asc"}},
+		Limit:       20,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cdse: %w", err)
@@ -108,7 +99,7 @@ func (p *cdseProvider) FindBestScene(
 
 // FindScenesInRange returns one SceneInfo per unique acquisition date in
 // [startDate, endDate]. A single STAC /search is issued for the whole range.
-func (p *cdseProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
+func (p *cdseProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string) ([]SceneInfo, error) {
 	opts := []string{
 		"AWS_S3_ENDPOINT=" + cdseS3Endpoint,
 		"AWS_ACCESS_KEY_ID=" + p.s3AccessKey,
@@ -119,7 +110,7 @@ func (p *cdseProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, sta
 		"GDAL_HTTP_MAX_RETRY=3",
 		"GDAL_HTTP_RETRY_DELAY=1",
 	}
-	return findScenesInRangeHelper(ctx, p.hc, cdseSTACBaseURL, bbox, startDate, endDate, maxCloud, []string{Sentinel2Collection},
+	return findScenesInRangeHelper(ctx, p.hc, cdseSTACBaseURL, bbox, startDate, endDate, []string{Sentinel2Collection},
 		func(_ context.Context, f stacRawFeature) (*BandURLs, error) {
 			b04 := f.Assets["B04_10m"]
 			b08 := f.Assets["B08_10m"]

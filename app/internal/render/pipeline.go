@@ -17,13 +17,16 @@ type TileParams struct {
 	Index            string
 	W, H             int
 	SearchWindowDays int
-	MaxCloudCover    float64
 	// Polygon is an optional WGS-84 clipping polygon ([longitude, latitude] pairs).
 	// Pixels outside the polygon are made transparent in the rendered PNG.
 	Polygon []geo.LngLat
 	// Palette overrides the default gradient colour map for the index.
 	// nil means use DefaultPalette(Index).
 	Palette []PaletteStop
+	// FillScenes lists neighbor scenes sorted by temporal proximity (closest first).
+	// Cloudy pixels identified via the SCL band are replaced with clear values
+	// from these scenes before the spectral index is computed.
+	FillScenes []*stac.BandURLs
 }
 
 // RenderTile runs the full satellite → index → PNG pipeline and returns a
@@ -39,7 +42,7 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) (*Re
 
 	// Find the best available satellite scene.
 	t1 := time.Now()
-	bands, err := stacClient.FindBestScene(ctx, bbox4326, p.Date, p.SearchWindowDays, p.MaxCloudCover)
+	bands, err := stacClient.FindBestScene(ctx, bbox4326, p.Date, p.SearchWindowDays)
 	if err != nil {
 		return nil, fmt.Errorf("find scene: %w", err)
 	}
@@ -50,7 +53,7 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) (*Re
 	if readErr != nil {
 		log.Printf("[pipeline] render failed (%v provider=%q), trying fallback: %v",
 			time.Since(t2).Round(time.Millisecond), bands.ProviderName, readErr)
-		fallback, fbErr := stacClient.FindBestSceneFallback(ctx, bbox4326, p.Date, p.SearchWindowDays, p.MaxCloudCover, bands.ProviderName)
+		fallback, fbErr := stacClient.FindBestSceneFallback(ctx, bbox4326, p.Date, p.SearchWindowDays, bands.ProviderName)
 		if fbErr != nil {
 			return nil, fmt.Errorf("render failed and fallback unavailable: %w (original: %v)", fbErr, readErr)
 		}
@@ -73,9 +76,10 @@ func RenderTile(ctx context.Context, p TileParams, stacClient *stac.Client) (*Re
 // For TCI (true-colour) tiles, RawValues and Stats are nil because there is
 // no single numeric index to summarise.
 type RenderResult struct {
-	PNG       []byte     // colour-mapped PNG (≈ 40–60 KB)
-	RawValues []float32  // row-major float32 index values, length = W×H; nil for TCI
-	Stats     *TileStats // per-tile stats; nil for TCI
+	PNG            []byte     // colour-mapped PNG (≈ 40–60 KB)
+	RawValues      []float32  // row-major float32 index values, length = W×H; nil for TCI
+	Stats          *TileStats // per-tile stats; nil for TCI
+	RemainingCloud float64    // fraction (0–1) of pixels still cloudy after fill; 0 if fill was not applied
 }
 
 // RenderFromBands renders the requested spectral index from pre-fetched band
@@ -96,6 +100,128 @@ func RenderFromBands(ctx context.Context, bands *stac.BandURLs, p TileParams) (*
 	log.Printf("[pipeline] RenderFromBands %s index=%s provider=%s total=%v",
 		p.Date, p.Index, bands.ProviderName, time.Since(t0).Round(time.Millisecond))
 	return result, nil
+}
+
+// ─── Cloud fill ──────────────────────────────────────────────────────────────
+
+// applyCloudFill replaces cloudy pixels in bufs with values from the nearest
+// clear neighbors listed in fills (sorted by temporal proximity).
+//
+// For each fill candidate it reads the SCL mask at the output resolution. If
+// the candidate has a clear pixel where the primary scene is cloudy, it reads
+// the fill bands (same order as bufs, URLs returned by urlFn) and copies them.
+// Iteration stops when all cloudy pixels have been filled or candidates run out.
+// Remaining unfilled pixels stay as-is (the index computation will produce NaN
+// or a low value, which the palette maps to transparent).
+// applyCloudFill returns the fraction (0–1) of pixels that are still cloudy
+// after fill. Returns 0 when fill is not attempted (no SCL, no candidates).
+func applyCloudFill(
+	sclURL string,
+	opts []string,
+	fills []*stac.BandURLs,
+	bbox geo.BBox,
+	w, h int,
+	date, index string,
+	bufs [][]float32,
+	urlFn func(*stac.BandURLs) []string,
+) float64 {
+	if sclURL == "" || len(fills) == 0 || len(bufs) == 0 {
+		return 0
+	}
+
+	mask, err := geo.ReadSCLCloudMask(sclURL, opts, bbox, w, h)
+	if err != nil {
+		log.Printf("[fill] %s/%s: read primary SCL: %v (skipping fill)", date, index, err)
+		return 0
+	}
+
+	cloudy := 0
+	for _, c := range mask {
+		if c {
+			cloudy++
+		}
+	}
+	if cloudy == 0 {
+		return 0
+	}
+
+	filled := 0
+	for _, fill := range fills {
+		if cloudy == 0 {
+			break
+		}
+		if fill.SCLURL == "" {
+			continue
+		}
+
+		fillMask, err := geo.ReadSCLCloudMask(fill.SCLURL, fill.GDALConfigOpts, bbox, w, h)
+		if err != nil {
+			continue
+		}
+
+		// Check whether this fill scene covers at least one of our cloudy pixels.
+		useful := false
+		for i, c := range mask {
+			if c && i < len(fillMask) && !fillMask[i] {
+				useful = true
+				break
+			}
+		}
+		if !useful {
+			continue
+		}
+
+		// Read fill bands concurrently.
+		type bandRes struct {
+			buf []float32
+			err error
+		}
+		urls := urlFn(fill)
+		chs := make([]chan bandRes, len(urls))
+		for k, u := range urls {
+			k, u := k, u
+			ch := make(chan bandRes, 1)
+			chs[k] = ch
+			go func() {
+				buf, err := geo.ReadBandWindow(u, fill.GDALConfigOpts, bbox, w, h)
+				ch <- bandRes{buf, err}
+			}()
+		}
+		fillBufs := make([][]float32, len(urls))
+		ok := true
+		for k, ch := range chs {
+			r := <-ch
+			if r.err != nil {
+				ok = false
+				break
+			}
+			fillBufs[k] = r.buf
+		}
+		if !ok {
+			continue
+		}
+
+		// Apply per-pixel fill.
+		for i := range mask {
+			if !mask[i] {
+				continue
+			}
+			if i >= len(fillMask) || fillMask[i] {
+				continue
+			}
+			for k := range bufs {
+				bufs[k][i] = fillBufs[k][i]
+			}
+			mask[i] = false
+			cloudy--
+			filled++
+		}
+	}
+
+	if filled > 0 {
+		log.Printf("[fill] %s/%s: filled %d px, %d still cloudy", date, index, filled, cloudy)
+	}
+	return float64(cloudy) / float64(len(mask))
 }
 
 // ─── renderWithBandURLs ───────────────────────────────────────────────────────
@@ -155,12 +281,14 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if blue.err != nil {
 			return nil, fmt.Errorf("TCI read Blue: %w", blue.err)
 		}
+		rc := applyCloudFill(bands.SCLURL, opts, p.FillScenes, bbox4326, w, h, p.Date, index,
+			[][]float32{red.buf, green.buf, blue.buf},
+			func(b *stac.BandURLs) []string { return []string{b.RedURL, b.GreenURL, b.BlueURL} })
 		pngBytes, err := RenderTCIPNG(red.buf, green.buf, blue.buf, w, h, pixelPoly)
 		if err != nil {
 			return nil, fmt.Errorf("render TCI PNG: %w", err)
 		}
-		// TCI has no scalar index — Stats and RawValues stay nil.
-		return &RenderResult{PNG: pngBytes}, nil
+		return &RenderResult{PNG: pngBytes, RemainingCloud: rc}, nil
 
 	case "evi":
 		if bands.RedURL == "" || bands.NIRURL == "" || bands.BlueURL == "" {
@@ -179,6 +307,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if blue.err != nil {
 			return nil, fmt.Errorf("EVI read Blue: %w", blue.err)
 		}
+		rc := applyCloudFill(bands.SCLURL, opts, p.FillScenes, bbox4326, w, h, p.Date, index,
+			[][]float32{red.buf, nir.buf, blue.buf},
+			func(b *stac.BandURLs) []string { return []string{b.RedURL, b.NIRURL, b.BlueURL} })
 		vals, err := ComputeEVI(red.buf, nir.buf, blue.buf)
 		if err != nil {
 			return nil, fmt.Errorf("compute EVI: %w", err)
@@ -187,7 +318,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("encode EVI PNG: %w", err)
 		}
-		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals)}, nil
+		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals), RemainingCloud: rc}, nil
 
 	case "gndvi":
 		if bands.NIRURL == "" || bands.GreenURL == "" {
@@ -202,6 +333,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if green.err != nil {
 			return nil, fmt.Errorf("GNDVI read Green: %w", green.err)
 		}
+		rc := applyCloudFill(bands.SCLURL, opts, p.FillScenes, bbox4326, w, h, p.Date, index,
+			[][]float32{nir.buf, green.buf},
+			func(b *stac.BandURLs) []string { return []string{b.NIRURL, b.GreenURL} })
 		vals, err := ComputeGNDVI(nir.buf, green.buf)
 		if err != nil {
 			return nil, fmt.Errorf("compute GNDVI: %w", err)
@@ -210,7 +344,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("encode GNDVI PNG: %w", err)
 		}
-		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals)}, nil
+		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals), RemainingCloud: rc}, nil
 
 	case "cvi":
 		if bands.RedURL == "" || bands.NIRURL == "" || bands.GreenURL == "" {
@@ -229,6 +363,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if green.err != nil {
 			return nil, fmt.Errorf("CVI read Green: %w", green.err)
 		}
+		rc := applyCloudFill(bands.SCLURL, opts, p.FillScenes, bbox4326, w, h, p.Date, index,
+			[][]float32{red.buf, nir.buf, green.buf},
+			func(b *stac.BandURLs) []string { return []string{b.RedURL, b.NIRURL, b.GreenURL} })
 		vals, err := ComputeCVI(red.buf, nir.buf, green.buf)
 		if err != nil {
 			return nil, fmt.Errorf("compute CVI: %w", err)
@@ -237,7 +374,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("encode CVI PNG: %w", err)
 		}
-		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals)}, nil
+		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals), RemainingCloud: rc}, nil
 
 	case "soilmoisture":
 		if bands.NIRURL == "" || bands.SWIRURL == "" {
@@ -252,6 +389,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if swir.err != nil {
 			return nil, fmt.Errorf("soilMoisture read SWIR: %w", swir.err)
 		}
+		rc := applyCloudFill(bands.SCLURL, opts, p.FillScenes, bbox4326, w, h, p.Date, index,
+			[][]float32{nir.buf, swir.buf},
+			func(b *stac.BandURLs) []string { return []string{b.NIRURL, b.SWIRURL} })
 		vals, err := ComputeSoilMoisture(nir.buf, swir.buf)
 		if err != nil {
 			return nil, fmt.Errorf("compute soilMoisture: %w", err)
@@ -260,7 +400,7 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("encode soilMoisture PNG: %w", err)
 		}
-		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals)}, nil
+		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals), RemainingCloud: rc}, nil
 
 	default: // "ndvi" and any unknown index name
 		if bands.RedURL == "" || bands.NIRURL == "" {
@@ -275,6 +415,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if nir.err != nil {
 			return nil, fmt.Errorf("NDVI read NIR: %w", nir.err)
 		}
+		rc := applyCloudFill(bands.SCLURL, opts, p.FillScenes, bbox4326, w, h, p.Date, index,
+			[][]float32{red.buf, nir.buf},
+			func(b *stac.BandURLs) []string { return []string{b.RedURL, b.NIRURL} })
 		vals, err := ComputeNDVI(red.buf, nir.buf)
 		if err != nil {
 			return nil, fmt.Errorf("compute NDVI: %w", err)
@@ -283,6 +426,6 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if err != nil {
 			return nil, fmt.Errorf("encode NDVI PNG: %w", err)
 		}
-		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals)}, nil
+		return &RenderResult{PNG: png, RawValues: vals, Stats: ComputeStats(vals), RemainingCloud: rc}, nil
 	}
 }

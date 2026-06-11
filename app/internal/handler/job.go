@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -39,6 +40,43 @@ type createJobRequest struct {
 	Indexes       []string     `json:"indexes,omitempty"` // default: ["ndvi"]
 }
 
+// buildFillCandidates returns BandURLs from all scenes except scenes[targetIdx],
+// sorted by ascending day-distance from the target scene's date.
+func buildFillCandidates(scenes []stac.SceneInfo, targetIdx int) []*stac.BandURLs {
+	if len(scenes) <= 1 {
+		return nil
+	}
+	target, err := time.Parse(time.DateOnly, scenes[targetIdx].Date)
+	if err != nil {
+		return nil
+	}
+	type entry struct {
+		dist int
+		b    *stac.BandURLs
+	}
+	entries := make([]entry, 0, len(scenes)-1)
+	for i, s := range scenes {
+		if i == targetIdx {
+			continue
+		}
+		d, err := time.Parse(time.DateOnly, s.Date)
+		if err != nil {
+			continue
+		}
+		diff := int(target.Sub(d).Hours() / 24)
+		if diff < 0 {
+			diff = -diff
+		}
+		entries = append(entries, entry{diff, s.Bands})
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].dist < entries[b].dist })
+	out := make([]*stac.BandURLs, len(entries))
+	for i, e := range entries {
+		out[i] = e.b
+	}
+	return out
+}
+
 // ServeCreateJob handles POST /api/jobs.
 //
 // Like ServeCreateRangeJob but supports multiple spectral indexes per job.
@@ -61,9 +99,6 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 	if req.BBox[0] >= req.BBox[2] || req.BBox[1] >= req.BBox[3] {
 		http.Error(w, "bbox must satisfy minX < maxX and minY < maxY", http.StatusBadRequest)
 		return
-	}
-	if req.MaxCloudCover <= 0 {
-		req.MaxCloudCover = rh.defaultMaxCloudCover
 	}
 	// Validate index names and fall back to ndvi.
 	validIndexes := map[string]bool{"ndvi": true, "evi": true, "gndvi": true, "cvi": true, "tci": true, "soilmoisture": true}
@@ -234,7 +269,7 @@ func (rh *RenderHandler) runJob(
 	// (defined in the stac package). Failure is fatal only when there is no
 	// cached data to fall back on.
 	var scenes []stac.SceneInfo
-	scenes, err = rh.stacClient.FindAllScenes(ctx, bbox4326, startDate, endDate, maxCloud)
+	scenes, err = rh.stacClient.FindAllScenes(ctx, bbox4326, startDate, endDate)
 	if err != nil {
 		if !hasCache {
 			_ = rh.store.SetJobFailed(ctx, jobID, fmt.Sprintf("STAC search: %v", err))
@@ -251,36 +286,61 @@ func (rh *RenderHandler) runJob(
 	log.Printf("[job] %s: cache=%d existing+%d repalette, STAC=%d scenes × %d indexes",
 		jobID, len(existingTiles), len(alternateTiles), len(scenes), len(indexes))
 
+	maxAOICloud := rh.maxAOICloud
+
 	var wg sync.WaitGroup
-	for _, scene := range scenes {
+	for i, scene := range scenes {
 		scene := scene
 
-		// AOI cloud check once per scene (not per-index).
-		if scene.Bands.SCLURL != "" {
-			fraction, sclErr := geo.AOICloudFraction(scene.Bands.SCLURL, scene.Bands.GDALConfigOpts, bbox4326)
-			if sclErr != nil {
-				log.Printf("[job] %s: %s: SCL read failed (%v), rendering anyway", jobID, scene.Date, sclErr)
-			} else if fraction*100 > maxCloud {
-				msg := fmt.Sprintf("skip %s: AOI cloud %.0f%% exceeds threshold %.0f%%", scene.Date, fraction*100, maxCloud)
-				log.Printf("[job] %s: %s", jobID, msg)
-				_ = rh.store.AppendJobError(ctx, jobID, msg)
-				// Count all indexes for this scene as "done" (skipped).
-				for range indexes {
-					_ = rh.store.IncrJobDone(ctx, jobID)
-				}
-				continue
-			}
-		}
-
+		// Fast path: determine which indexes still need rendering before doing
+		// any expensive GDAL/network work (SCL read, fill candidates).
+		var needsRender []string
 		for _, index := range indexes {
-			index := index
-
-			// Skip if already cached.
 			if _, found, _ := rh.store.Lookup(ctx, bbox, scene.Date, index, w, h, polygonHash, paletteHash); found {
 				log.Printf("[job] %s: skip %s/%s (cached)", jobID, scene.Date, index)
 				_ = rh.store.IncrJobDone(ctx, jobID)
-				continue
+			} else {
+				needsRender = append(needsRender, index)
 			}
+		}
+		if len(needsRender) == 0 {
+			continue
+		}
+
+		// AOI cloud check: scenes below maxAOICloud get pixel-level fill from
+		// neighbour scenes; scenes above threshold are rendered as-is (no fill).
+		// No scenes are skipped — all dates are returned regardless of cloud cover.
+		// aoiFraction is used as the post-render cloud estimate for no-fill scenes.
+		var aoiFraction float64
+		fillCandidates := buildFillCandidates(scenes, i)
+		if scene.Bands.SCLURL != "" {
+			f, sclErr := geo.AOICloudFraction(scene.Bands.SCLURL, scene.Bands.GDALConfigOpts, bbox4326)
+			if sclErr != nil {
+				log.Printf("[job] %s: %s: SCL read failed (%v), rendering without fill", jobID, scene.Date, sclErr)
+				fillCandidates = nil
+			} else {
+				aoiFraction = f
+				if f*100 >= maxAOICloud {
+					log.Printf("[job] %s: %s: AOI cloud %.0f%% >= %.0f%%, rendering without fill", jobID, scene.Date, f*100, maxAOICloud)
+					fillCandidates = nil
+				}
+			}
+		}
+
+		// Pre-render short-circuit: fill won't run AND we know the post-render
+		// cloud check will reject this scene anyway — skip the render entirely.
+		if maxCloud > 0 && fillCandidates == nil && aoiFraction > 0 && aoiFraction*100 > maxCloud {
+			for _, index := range needsRender {
+				msg := fmt.Sprintf("skip %s/%s: post-fill cloud %.0f%% > max_cloud_cover %.0f%%", scene.Date, index, aoiFraction*100, maxCloud)
+				log.Printf("[job] %s: %s", jobID, msg)
+				_ = rh.store.AppendJobError(ctx, jobID, msg)
+				_ = rh.store.IncrJobDone(ctx, jobID)
+			}
+			continue
+		}
+
+		for _, index := range needsRender {
+			index := index
 
 			rh.sem <- struct{}{}
 			wg.Add(1)
@@ -288,23 +348,23 @@ func (rh *RenderHandler) runJob(
 				defer func() { <-rh.sem; wg.Done() }()
 
 				params := render.TileParams{
-					BBox:    bbox,
-					Date:    scene.Date,
-					Index:   index,
-					W:       w,
-					H:       h,
-					Polygon: polygon,
-					Palette: palettes[index],
+					BBox:       bbox,
+					Date:       scene.Date,
+					Index:      index,
+					W:          w,
+					H:          h,
+					Polygon:    polygon,
+					Palette:    palettes[index],
+					FillScenes: fillCandidates,
 				}
-				const maxRenderAttempts = 3
 				var result *render.RenderResult
 				var renderErr error
-				for attempt := range maxRenderAttempts {
+				for attempt := range rh.maxRenderAttempts {
 					result, renderErr = render.RenderFromBands(ctx, scene.Bands, params)
 					if renderErr == nil {
 						break
 					}
-					if attempt < maxRenderAttempts-1 {
+					if attempt < rh.maxRenderAttempts-1 {
 						log.Printf("[job] %s: %s/%s: attempt %d failed, retrying: %v", jobID, scene.Date, index, attempt+1, renderErr)
 					}
 				}
@@ -313,14 +373,29 @@ func (rh *RenderHandler) runJob(
 					log.Printf("[job] %s: render failed: %s", jobID, msg)
 					_ = rh.store.AppendJobError(ctx, jobID, msg)
 				} else {
-					var statsJSON []byte
-					if result.Stats != nil {
-						statsJSON, _ = json.Marshal(result.Stats)
+					// Post-render cloud check against user-supplied max_cloud_cover.
+					// For filled scenes use the post-fill remaining fraction;
+					// for unfilled scenes use the AOI fraction measured before rendering.
+					var remainingCloud float64
+					if fillCandidates != nil {
+						remainingCloud = result.RemainingCloud
+					} else {
+						remainingCloud = aoiFraction
 					}
-					if saveErr := rh.store.Save(ctx, bbox, scene.Date, index, w, h, result.PNG, result.RawValues, polygonHash, tokenPrefix, paletteHash, statsJSON, scene.CloudCover); saveErr != nil {
-						msg := fmt.Sprintf("%s/%s: save: %v", scene.Date, index, saveErr)
+					if maxCloud > 0 && remainingCloud*100 > maxCloud {
+						msg := fmt.Sprintf("skip %s/%s: post-fill cloud %.0f%% > max_cloud_cover %.0f%%", scene.Date, index, remainingCloud*100, maxCloud)
 						log.Printf("[job] %s: %s", jobID, msg)
 						_ = rh.store.AppendJobError(ctx, jobID, msg)
+					} else {
+						var statsJSON []byte
+						if result.Stats != nil {
+							statsJSON, _ = json.Marshal(result.Stats)
+						}
+						if saveErr := rh.store.Save(ctx, bbox, scene.Date, index, w, h, result.PNG, result.RawValues, polygonHash, tokenPrefix, paletteHash, statsJSON, scene.CloudCover); saveErr != nil {
+							msg := fmt.Sprintf("%s/%s: save: %v", scene.Date, index, saveErr)
+							log.Printf("[job] %s: %s", jobID, msg)
+							_ = rh.store.AppendJobError(ctx, jobID, msg)
+						}
 					}
 				}
 				_ = rh.store.IncrJobDone(ctx, jobID)

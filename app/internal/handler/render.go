@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/qwezert/geogoservice/internal/cache"
+	"github.com/qwezert/geogoservice/internal/config"
 	"github.com/qwezert/geogoservice/internal/geo"
 	"github.com/qwezert/geogoservice/internal/render"
 	"github.com/qwezert/geogoservice/internal/stac"
@@ -35,18 +36,21 @@ import (
 type RenderHandler struct {
 	store      *cache.Store
 	stacClient *stac.Client
-	sem        chan struct{}      // limits concurrent GDAL renders
+	sem        chan struct{}       // limits concurrent GDAL renders
 	sf         singleflight.Group // deduplicates in-flight renders for the same tile
 
-	// Default STAC search parameters — overridable per-request via query string.
 	defaultSearchWindowDays int
-	defaultMaxCloudCover    float64
+	maxAOICloud             float64 // AOI cloud fraction hard limit for scene skip (0–100)
+	maxRenderAttempts       int     // render retry count per scene/index
 }
 
 // HandlerOptions carries configurable defaults for the render handler.
 type HandlerOptions struct {
 	DefaultSearchWindowDays int
-	DefaultMaxCloudCover    float64
+	// MaxAOICloudCover is the AOI-level cloud % above which a scene is skipped (default 80).
+	MaxAOICloudCover float64
+	// MaxRenderAttempts is the number of render retries before marking a scene as failed (default 3).
+	MaxRenderAttempts int
 	// RenderWorkers caps concurrent GDAL render operations. 0 = runtime.NumCPU().
 	RenderWorkers int
 }
@@ -55,11 +59,15 @@ type HandlerOptions struct {
 func New(store *cache.Store, stacClient *stac.Client, opts HandlerOptions) *RenderHandler {
 	searchWindow := opts.DefaultSearchWindowDays
 	if searchWindow <= 0 {
-		searchWindow = 15
+		searchWindow = config.DefaultSTACSearchWindowDays
 	}
-	maxCloud := opts.DefaultMaxCloudCover
-	if maxCloud <= 0 {
-		maxCloud = 20.0
+	maxAOICloud := opts.MaxAOICloudCover
+	if maxAOICloud <= 0 {
+		maxAOICloud = config.DefaultMaxAOICloudCover
+	}
+	maxRenderAttempts := opts.MaxRenderAttempts
+	if maxRenderAttempts <= 0 {
+		maxRenderAttempts = config.DefaultMaxRenderAttempts
 	}
 	workers := opts.RenderWorkers
 	if workers <= 0 {
@@ -70,7 +78,8 @@ func New(store *cache.Store, stacClient *stac.Client, opts HandlerOptions) *Rend
 		stacClient:              stacClient,
 		sem:                     make(chan struct{}, workers),
 		defaultSearchWindowDays: searchWindow,
-		defaultMaxCloudCover:    maxCloud,
+		maxAOICloud:             maxAOICloud,
+		maxRenderAttempts:       maxRenderAttempts,
 	}
 }
 
@@ -85,7 +94,7 @@ func (rh *RenderHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleSync checks cache and, on miss, renders synchronously.
 func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
-	params, err := parseParams(r, rh.defaultSearchWindowDays, rh.defaultMaxCloudCover)
+	params, err := parseParams(r, rh.defaultSearchWindowDays)
 	if err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
@@ -134,8 +143,7 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 			W:                params.w,
 			H:                params.h,
 			SearchWindowDays: params.searchWindowDays,
-			MaxCloudCover:    params.maxCloudCover,
-			Polygon:          params.polygon,
+				Polygon:          params.polygon,
 			Palette:          palette,
 		}, rh.stacClient)
 		if renderErr != nil {
@@ -176,15 +184,13 @@ type renderParams struct {
 	index            string
 	w, h             int
 	searchWindowDays int
-	maxCloudCover    float64
 	noCache          bool // skip cache lookup and save (load-testing)
 	polygon          []geo.LngLat
 }
 
 // parseParams accepts both the modern and legacy GeoServer parameter formats.
-// defaultWindow and defaultCloud are used when the caller does not supply
-// the corresponding query parameters.
-func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*renderParams, error) {
+// defaultWindow is used when the caller does not supply the window query parameter.
+func parseParams(r *http.Request, defaultWindow int) (*renderParams, error) {
 	q := r.URL.Query()
 
 	// ── bbox ─────────────────────────────────────────────────────────────────
@@ -248,15 +254,6 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 		}
 	}
 
-	maxCloud := defaultCloud
-	if v := q.Get("cloud"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
-			maxCloud = f
-		} else {
-			return nil, fmt.Errorf("cloud must be a number in [0, 100], got %q", v)
-		}
-	}
-
 	noCache := q.Get("nocache") == "1" || q.Get("nocache") == "true"
 
 	var polygon []geo.LngLat
@@ -275,7 +272,6 @@ func parseParams(r *http.Request, defaultWindow int, defaultCloud float64) (*ren
 		w:                width,
 		h:                height,
 		searchWindowDays: searchWindow,
-		maxCloudCover:    maxCloud,
 		noCache:          noCache,
 		polygon:          polygon,
 	}, nil

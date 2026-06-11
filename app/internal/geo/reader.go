@@ -136,8 +136,8 @@ func clampInt(v, lo, hi int) int {
 
 // AOICloudFraction reads the Sentinel-2 Scene Classification Layer (SCL) band
 // at 64×64 resolution over bbox and returns the fraction (0–1) of pixels
-// classified as cloud (SCL 8 = medium probability, 9 = high probability,
-// 10 = thin cirrus).
+// classified as no data, cloud, or shadow (SCL 0 = no data, 3 = cloud shadow,
+// 8 = medium probability, 9 = high probability, 10 = thin cirrus).
 //
 // Returns 0, nil when sclURL is empty so callers can treat a missing SCL as
 // "cloud-free" rather than blocking the render.
@@ -159,9 +159,25 @@ func AOICloudFraction(sclURL string, configOpts []string, bbox BBox) (float64, e
 	for _, v := range pixels {
 		// Round float32 SCL value to nearest integer class.
 		cls := int(v + 0.5)
-		if cls == 8 || cls == 9 || cls == 10 {
+		if cls == 0 || cls == 3 || cls == 8 || cls == 9 || cls == 10 {
 			cloud++
 		}
 	}
 	return float64(cloud) / float64(len(pixels)), nil
+}
+
+// ReadSCLCloudMask reads the Sentinel-2 SCL band at w×h resolution over bbox
+// and returns a per-pixel boolean mask where true = no data, cloud, or shadow
+// (SCL class 0=no data, 3=cloud shadow, 8=medium cloud, 9=high cloud, 10=thin cirrus).
+func ReadSCLCloudMask(sclURL string, configOpts []string, bbox BBox, w, h int) ([]bool, error) {
+	pixels, err := ReadBandWindow(sclURL, configOpts, bbox, w, h)
+	if err != nil {
+		return nil, fmt.Errorf("read SCL: %w", err)
+	}
+	mask := make([]bool, len(pixels))
+	for i, v := range pixels {
+		cls := int(v + 0.5)
+		mask[i] = cls == 0 || cls == 3 || cls == 8 || cls == 9 || cls == 10
+	}
+	return mask, nil
 }

@@ -47,7 +47,7 @@ func newPlanetaryComputerProvider(hc *http.Client) *planetaryComputerProvider {
 
 func (p *planetaryComputerProvider) Name() string { return ProviderPlanetaryComputer }
 
-func (p *planetaryComputerProvider) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int, maxCloud float64) (*BandURLs, error) {
+func (p *planetaryComputerProvider) FindBestScene(ctx context.Context, bbox geo.BBox, date string, windowDays int) (*BandURLs, error) {
 	datetime, err := buildDatetimeInterval(date, windowDays)
 	if err != nil {
 		return nil, err
@@ -78,8 +78,8 @@ func (p *planetaryComputerProvider) FindBestScene(ctx context.Context, bbox geo.
 
 // FindScenesInRange returns one SceneInfo per unique acquisition date in
 // [startDate, endDate], combining Sentinel-2 and Landsat scenes.
-func (p *planetaryComputerProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string, maxCloud float64) ([]SceneInfo, error) {
-	return findScenesInRangeHelper(ctx, p.hc, pcBaseURL, bbox, startDate, endDate, maxCloud, pcCollections,
+func (p *planetaryComputerProvider) FindScenesInRange(ctx context.Context, bbox geo.BBox, startDate, endDate string) ([]SceneInfo, error) {
+	return findScenesInRangeHelper(ctx, p.hc, pcBaseURL, bbox, startDate, endDate, pcCollections,
 		func(ctx context.Context, f stacRawFeature) (*BandURLs, error) {
 			return p.pcExtractBands(ctx, f)
 		})

@@ -7,6 +7,16 @@ import (
 	"strconv"
 )
 
+// Default values for optional configuration fields.
+const (
+	DefaultPort                 = "8080"
+	DefaultSTACProvider         = "planetary-computer"
+	DefaultSTACSearchWindowDays = 15
+	DefaultMaxAOICloudCover     = 80.0
+	DefaultMaxRenderAttempts    = 3
+
+)
+
 // Config holds all runtime configuration for the service.
 type Config struct {
 	Port string
@@ -32,9 +42,14 @@ type Config struct {
 	// when querying for Sentinel-2 scenes. Default: 15.
 	STACSearchWindowDays int
 
-	// STACMaxCloudCover is the maximum acceptable cloud cover percentage (0–100).
-	// Default: 20.
-	STACMaxCloudCover float64
+	// MaxAOICloudCover is the hard upper limit (0–100) for AOI-level cloud fraction
+	// before a scene is skipped entirely. Pixel-level fill handles partial clouds below
+	// this threshold. Default: 80.
+	MaxAOICloudCover float64
+
+	// MaxRenderAttempts is how many times a failed render is retried before the
+	// scene is marked as an error. Default: 3.
+	MaxRenderAttempts int
 
 	// RenderWorkers is the number of goroutines in the async render worker pool.
 	// Defaults to runtime.NumCPU() when 0.
@@ -74,25 +89,32 @@ func Load() (*Config, error) {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = DefaultPort
 	}
 
 	stacProvider := os.Getenv("STAC_PROVIDER")
 	if stacProvider == "" {
-		stacProvider = "planetary-computer"
+		stacProvider = DefaultSTACProvider
 	}
 
-	searchWindow := 15
+	searchWindow := DefaultSTACSearchWindowDays
 	if v := os.Getenv("STAC_SEARCH_WINDOW_DAYS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			searchWindow = n
 		}
 	}
 
-	maxCloud := 20.0
-	if v := os.Getenv("STAC_MAX_CLOUD_COVER"); v != "" {
+	maxAOICloud := DefaultMaxAOICloudCover
+	if v := os.Getenv("MAX_AOI_CLOUD_COVER"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
-			maxCloud = f
+			maxAOICloud = f
+		}
+	}
+
+	maxRenderAttempts := DefaultMaxRenderAttempts
+	if v := os.Getenv("MAX_RENDER_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxRenderAttempts = n
 		}
 	}
 
@@ -110,7 +132,8 @@ func Load() (*Config, error) {
 		MinioUseSSL:          useSSL,
 		STACProvider:         stacProvider,
 		STACSearchWindowDays: searchWindow,
-		STACMaxCloudCover:    maxCloud,
+		MaxAOICloudCover:     maxAOICloud,
+		MaxRenderAttempts:    maxRenderAttempts,
 		RedisURL:             os.Getenv("REDIS_URL"),
 		RenderWorkers:        func() int { n, _ := strconv.Atoi(os.Getenv("RENDER_WORKERS")); return n }(),
 		CDSES3AccessKey:      os.Getenv("CDSE_S3_ACCESS_KEY"),

@@ -143,11 +143,6 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	if searchWindow <= 0 {
 		searchWindow = rh.defaultSearchWindowDays
 	}
-	maxCloud := req.MaxCloudCover
-	if maxCloud <= 0 {
-		maxCloud = rh.defaultMaxCloudCover
-	}
-
 	polygon := make([]geo.LngLat, len(req.Polygon))
 	for i, pt := range req.Polygon {
 		polygon[i] = geo.LngLat{pt[0], pt[1]}
@@ -183,7 +178,6 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 		W:                req.W,
 		H:                req.H,
 		SearchWindowDays: searchWindow,
-		MaxCloudCover:    maxCloud,
 		Polygon:          polygon,
 		Palette:          palette,
 	}, rh.stacClient)

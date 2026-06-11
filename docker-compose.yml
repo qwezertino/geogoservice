@@ -27,8 +27,8 @@ x-app-env: &app-env
   # STAC provider tried first: "planetary-computer" (default), "earth-search", "cdse"
   # On failure the remaining providers are raced automatically.
   STAC_PROVIDER: ${STAC_PROVIDER:-planetary-computer}
-  # Scene search window: ±N days around the requested date (default 15)
-  STAC_SEARCH_WINDOW_DAYS: ${STAC_SEARCH_WINDOW_DAYS:-15}
+  # Scene search window: ±N days around the requested date (default 5)
+  STAC_SEARCH_WINDOW_DAYS: ${STAC_SEARCH_WINDOW_DAYS:-5}
   # Maximum acceptable cloud cover percent 0–100 (default 20)
   STAC_MAX_CLOUD_COVER: ${STAC_MAX_CLOUD_COVER:-20}
   # CDSE S3 credentials — required only when STAC_PROVIDER=cdse

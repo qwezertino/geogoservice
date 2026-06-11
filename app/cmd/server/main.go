@@ -66,7 +66,8 @@ func run() error {
 
 	renderHandler := handler.New(store, stacClient, handler.HandlerOptions{
 		DefaultSearchWindowDays: cfg.STACSearchWindowDays,
-		DefaultMaxCloudCover:    cfg.STACMaxCloudCover,
+		MaxAOICloudCover:        cfg.MaxAOICloudCover,
+		MaxRenderAttempts:       cfg.MaxRenderAttempts,
 		RenderWorkers:           cfg.RenderWorkers,
 	})
 

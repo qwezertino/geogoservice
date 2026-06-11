@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 
 	"github.com/qwezert/geogoservice/internal/geo"
 )
@@ -73,19 +72,8 @@ func (rh *RenderHandler) ServeScenes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── max cloud ────────────────────────────────────────────────────────────
-	maxCloud := 20.0
-	if v := q.Get("max_cloud"); v != "" {
-		mc, err := strconv.ParseFloat(v, 64)
-		if err != nil || mc < 0 || mc > 100 {
-			http.Error(w, "max_cloud must be a float in [0, 100]", http.StatusBadRequest)
-			return
-		}
-		maxCloud = mc
-	}
-
 	// ── STAC search ───────────────────────────────────────────────────────────
-	scenes, err := rh.stacClient.FindAllScenes(r.Context(), bbox4326, dateFrom, dateTo, maxCloud)
+	scenes, err := rh.stacClient.FindAllScenes(r.Context(), bbox4326, dateFrom, dateTo)
 	if err != nil {
 		http.Error(w, "STAC search failed: "+err.Error(), http.StatusBadGateway)
 		fmt.Printf("[scenes] STAC search error: %v\n", err)
