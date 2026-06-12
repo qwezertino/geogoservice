@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,6 +82,7 @@ func buildFillCandidates(scenes []stac.SceneInfo, targetIdx int) []*stac.BandURL
 // The server renders every (scene, index) pair and stores the results with
 // per-tile statistics (min/max/mean/histogram) and cloud cover metadata.
 func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB
 	var req createJobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -112,6 +112,11 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 		}
+	}
+
+	if len(req.Polygon) > maxPolygonVertices {
+		http.Error(w, fmt.Sprintf("polygon exceeds limit of %d vertices", maxPolygonVertices), http.StatusBadRequest)
+		return
 	}
 
 	bbox := geo.BBox{MinX: req.BBox[0], MinY: req.BBox[1], MaxX: req.BBox[2], MaxY: req.BBox[3]}
@@ -242,7 +247,7 @@ func (rh *RenderHandler) runJob(
 	palettes map[string][]render.PaletteStop,
 	indexes []string,
 ) {
-	ctx := context.Background()
+	ctx := rh.svcCtx
 
 	bbox4326, err := geo.Transform3857To4326(bbox)
 	if err != nil {

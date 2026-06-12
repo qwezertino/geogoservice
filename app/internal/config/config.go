@@ -85,7 +85,15 @@ func Load() (*Config, error) {
 		}
 	}
 
-	useSSL, _ := strconv.ParseBool(os.Getenv("MINIO_USE_SSL"))
+	sslStr := os.Getenv("MINIO_USE_SSL")
+	var useSSL bool
+	if sslStr != "" {
+		var sslErr error
+		useSSL, sslErr = strconv.ParseBool(sslStr)
+		if sslErr != nil {
+			return nil, fmt.Errorf("invalid MINIO_USE_SSL %q: must be true or false", sslStr)
+		}
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {

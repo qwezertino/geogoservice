@@ -38,6 +38,7 @@ type RenderHandler struct {
 	stacClient *stac.Client
 	sem        chan struct{}       // limits concurrent GDAL renders
 	sf         singleflight.Group // deduplicates in-flight renders for the same tile
+	svcCtx     context.Context    // service-level context; cancelled on shutdown
 
 	defaultSearchWindowDays int
 	maxAOICloud             float64 // AOI cloud fraction hard limit for scene skip (0–100)
@@ -56,7 +57,9 @@ type HandlerOptions struct {
 }
 
 // New creates a RenderHandler with the given dependencies.
-func New(store *cache.Store, stacClient *stac.Client, opts HandlerOptions) *RenderHandler {
+// ctx should be the application-level context so that background job goroutines
+// are cancelled when the server shuts down.
+func New(ctx context.Context, store *cache.Store, stacClient *stac.Client, opts HandlerOptions) *RenderHandler {
 	searchWindow := opts.DefaultSearchWindowDays
 	if searchWindow <= 0 {
 		searchWindow = config.DefaultSTACSearchWindowDays
@@ -77,6 +80,7 @@ func New(store *cache.Store, stacClient *stac.Client, opts HandlerOptions) *Rend
 		store:                   store,
 		stacClient:              stacClient,
 		sem:                     make(chan struct{}, workers),
+		svcCtx:                  ctx,
 		defaultSearchWindowDays: searchWindow,
 		maxAOICloud:             maxAOICloud,
 		maxRenderAttempts:       maxRenderAttempts,
@@ -277,12 +281,17 @@ func parseParams(r *http.Request, defaultWindow int) (*renderParams, error) {
 	}, nil
 }
 
+const maxPolygonVertices = 1000
+
 // parsePolygon parses a flat "lng1,lat1,lng2,lat2,..." string into LngLat pairs.
-// Requires at least 3 pairs (6 values).
+// Requires at least 3 pairs (6 values) and at most maxPolygonVertices pairs.
 func parsePolygon(raw string) ([]geo.LngLat, error) {
 	parts := strings.Split(raw, ",")
 	if len(parts) < 6 || len(parts)%2 != 0 {
 		return nil, fmt.Errorf("need at least 3 lng,lat pairs (%d values given)", len(parts))
+	}
+	if len(parts)/2 > maxPolygonVertices {
+		return nil, fmt.Errorf("polygon exceeds maximum of %d vertices (%d given)", maxPolygonVertices, len(parts)/2)
 	}
 	pts := make([]geo.LngLat, len(parts)/2)
 	for i := range pts {
@@ -297,8 +306,8 @@ func parsePolygon(raw string) ([]geo.LngLat, error) {
 		if lng < -180 || lng > 180 {
 			return nil, fmt.Errorf("longitude %v at pair %d out of range [-180, 180]", lng, i)
 		}
-		if lat < -90 || lat > 90 {
-			return nil, fmt.Errorf("latitude %v at pair %d out of range [-90, 90]", lat, i)
+		if lat <= -90 || lat >= 90 {
+			return nil, fmt.Errorf("latitude %v at pair %d out of range (-90, 90); poles are not supported", lat, i)
 		}
 		pts[i] = geo.LngLat{lng, lat}
 	}

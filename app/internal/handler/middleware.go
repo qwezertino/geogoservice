@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -55,7 +56,7 @@ func RequireAdmin(adminToken string) func(http.Handler) http.Handler {
 				writeJSONError(w, http.StatusServiceUnavailable, "admin endpoints not configured")
 				return
 			}
-			if r.Header.Get("X-Admin-Token") != adminToken {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Admin-Token")), []byte(adminToken)) != 1 {
 				writeJSONError(w, http.StatusForbidden, "invalid admin token")
 				return
 			}

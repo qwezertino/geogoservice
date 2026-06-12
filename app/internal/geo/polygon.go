@@ -14,14 +14,19 @@ type LngLat [2]float64
 // EPSG:3857 tile bounding box. The returned [][2]float64 contains [x, y] pairs
 // in pixel space where (0, 0) is the top-left corner of the tile image.
 func PolygonToPixels(poly []LngLat, bbox3857 BBox, w, h int) [][2]float64 {
+	bboxW := bbox3857.MaxX - bbox3857.MinX
+	bboxH := bbox3857.MaxY - bbox3857.MinY
+	if bboxW == 0 || bboxH == 0 {
+		return nil
+	}
 	px := make([][2]float64, len(poly))
 	fw := float64(w)
 	fh := float64(h)
 	for i, pt := range poly {
 		x3857, y3857 := wgs84To3857(pt[0], pt[1])
 		px[i] = [2]float64{
-			(x3857 - bbox3857.MinX) / (bbox3857.MaxX - bbox3857.MinX) * fw,
-			(bbox3857.MaxY - y3857) / (bbox3857.MaxY - bbox3857.MinY) * fh,
+			(x3857 - bbox3857.MinX) / bboxW * fw,
+			(bbox3857.MaxY - y3857) / bboxH * fh,
 		}
 	}
 	return px

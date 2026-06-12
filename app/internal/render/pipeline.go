@@ -193,9 +193,9 @@ func applyCloudFill(
 			r := <-ch
 			if r.err != nil {
 				ok = false
-				break
+			} else {
+				fillBufs[k] = r.buf
 			}
-			fillBufs[k] = r.buf
 		}
 		if !ok {
 			continue
@@ -234,10 +234,15 @@ type bandReadResult struct {
 }
 
 // readBandAsync launches a goroutine to read one band window and returns a
-// buffered channel carrying the result.
-func readBandAsync(url string, opts []string, bbox geo.BBox, w, h int) <-chan bandReadResult {
+// buffered channel carrying the result. It checks ctx before starting the
+// (blocking) GDAL call so cancelled requests don't queue up GDAL work.
+func readBandAsync(ctx context.Context, url string, opts []string, bbox geo.BBox, w, h int) <-chan bandReadResult {
 	ch := make(chan bandReadResult, 1)
 	go func() {
+		if err := ctx.Err(); err != nil {
+			ch <- bandReadResult{err: err}
+			return
+		}
 		t := time.Now()
 		buf, err := geo.ReadBandWindow(url, opts, bbox, w, h)
 		ch <- bandReadResult{buf, err, time.Since(t).Round(time.Millisecond)}
@@ -248,7 +253,7 @@ func readBandAsync(url string, opts []string, bbox geo.BBox, w, h int) <-chan ba
 // renderWithBandURLs dispatches to the correct computation path based on
 // p.Index. All band reads are kicked off concurrently; only the channels
 // needed by the selected index are drained.
-func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, bbox4326 geo.BBox) (*RenderResult, error) {
+func renderWithBandURLs(ctx context.Context, bands *stac.BandURLs, p TileParams, bbox4326 geo.BBox) (*RenderResult, error) {
 	index := p.Index
 	if index == "" {
 		index = "ndvi"
@@ -268,9 +273,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if bands.RedURL == "" || bands.GreenURL == "" || bands.BlueURL == "" {
 			return nil, fmt.Errorf("TCI requires Red, Green, Blue bands but one or more URLs are empty")
 		}
-		redCh := readBandAsync(bands.RedURL, opts, bbox4326, w, h)
-		greenCh := readBandAsync(bands.GreenURL, opts, bbox4326, w, h)
-		blueCh := readBandAsync(bands.BlueURL, opts, bbox4326, w, h)
+		redCh := readBandAsync(ctx, bands.RedURL, opts, bbox4326, w, h)
+		greenCh := readBandAsync(ctx, bands.GreenURL, opts, bbox4326, w, h)
+		blueCh := readBandAsync(ctx, bands.BlueURL, opts, bbox4326, w, h)
 		red, green, blue := <-redCh, <-greenCh, <-blueCh
 		if red.err != nil {
 			return nil, fmt.Errorf("TCI read Red: %w", red.err)
@@ -294,9 +299,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if bands.RedURL == "" || bands.NIRURL == "" || bands.BlueURL == "" {
 			return nil, fmt.Errorf("EVI requires Red, NIR, Blue bands")
 		}
-		redCh := readBandAsync(bands.RedURL, opts, bbox4326, w, h)
-		nirCh := readBandAsync(bands.NIRURL, opts, bbox4326, w, h)
-		blueCh := readBandAsync(bands.BlueURL, opts, bbox4326, w, h)
+		redCh := readBandAsync(ctx, bands.RedURL, opts, bbox4326, w, h)
+		nirCh := readBandAsync(ctx, bands.NIRURL, opts, bbox4326, w, h)
+		blueCh := readBandAsync(ctx, bands.BlueURL, opts, bbox4326, w, h)
 		red, nir, blue := <-redCh, <-nirCh, <-blueCh
 		if red.err != nil {
 			return nil, fmt.Errorf("EVI read Red: %w", red.err)
@@ -324,8 +329,8 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if bands.NIRURL == "" || bands.GreenURL == "" {
 			return nil, fmt.Errorf("GNDVI requires NIR and Green bands")
 		}
-		nirCh := readBandAsync(bands.NIRURL, opts, bbox4326, w, h)
-		greenCh := readBandAsync(bands.GreenURL, opts, bbox4326, w, h)
+		nirCh := readBandAsync(ctx, bands.NIRURL, opts, bbox4326, w, h)
+		greenCh := readBandAsync(ctx, bands.GreenURL, opts, bbox4326, w, h)
 		nir, green := <-nirCh, <-greenCh
 		if nir.err != nil {
 			return nil, fmt.Errorf("GNDVI read NIR: %w", nir.err)
@@ -350,9 +355,9 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if bands.RedURL == "" || bands.NIRURL == "" || bands.GreenURL == "" {
 			return nil, fmt.Errorf("CVI requires Red, NIR, Green bands")
 		}
-		redCh := readBandAsync(bands.RedURL, opts, bbox4326, w, h)
-		nirCh := readBandAsync(bands.NIRURL, opts, bbox4326, w, h)
-		greenCh := readBandAsync(bands.GreenURL, opts, bbox4326, w, h)
+		redCh := readBandAsync(ctx, bands.RedURL, opts, bbox4326, w, h)
+		nirCh := readBandAsync(ctx, bands.NIRURL, opts, bbox4326, w, h)
+		greenCh := readBandAsync(ctx, bands.GreenURL, opts, bbox4326, w, h)
 		red, nir, green := <-redCh, <-nirCh, <-greenCh
 		if red.err != nil {
 			return nil, fmt.Errorf("CVI read Red: %w", red.err)
@@ -380,8 +385,8 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if bands.NIRURL == "" || bands.SWIRURL == "" {
 			return nil, fmt.Errorf("soilMoisture requires NIR and SWIR bands")
 		}
-		nirCh := readBandAsync(bands.NIRURL, opts, bbox4326, w, h)
-		swirCh := readBandAsync(bands.SWIRURL, opts, bbox4326, w, h)
+		nirCh := readBandAsync(ctx, bands.NIRURL, opts, bbox4326, w, h)
+		swirCh := readBandAsync(ctx, bands.SWIRURL, opts, bbox4326, w, h)
 		nir, swir := <-nirCh, <-swirCh
 		if nir.err != nil {
 			return nil, fmt.Errorf("soilMoisture read NIR: %w", nir.err)
@@ -406,8 +411,8 @@ func renderWithBandURLs(_ context.Context, bands *stac.BandURLs, p TileParams, b
 		if bands.RedURL == "" || bands.NIRURL == "" {
 			return nil, fmt.Errorf("NDVI requires Red and NIR bands")
 		}
-		redCh := readBandAsync(bands.RedURL, opts, bbox4326, w, h)
-		nirCh := readBandAsync(bands.NIRURL, opts, bbox4326, w, h)
+		redCh := readBandAsync(ctx, bands.RedURL, opts, bbox4326, w, h)
+		nirCh := readBandAsync(ctx, bands.NIRURL, opts, bbox4326, w, h)
 		red, nir := <-redCh, <-nirCh
 		if red.err != nil {
 			return nil, fmt.Errorf("NDVI read Red: %w", red.err)

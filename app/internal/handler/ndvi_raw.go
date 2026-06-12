@@ -126,5 +126,3 @@ func isNotFoundError(err error) bool {
 		strings.Contains(s, "does not exist") ||
 		strings.Contains(s, "not found")
 }
-
-var _ = cache.ErrNotFound

@@ -64,5 +64,7 @@ func (rh *RenderHandler) ServeUpdateSettings(w http.ResponseWriter, r *http.Requ
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = fmt.Fprintf(w, `{"settings":%s}`, body)
+	if err := json.NewEncoder(w).Encode(map[string]json.RawMessage{"settings": body}); err != nil {
+		fmt.Printf("[me] encode settings response: %v\n", err)
+	}
 }

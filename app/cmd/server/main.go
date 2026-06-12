@@ -64,7 +64,7 @@ func run() error {
 
 	mux := http.NewServeMux()
 
-	renderHandler := handler.New(store, stacClient, handler.HandlerOptions{
+	renderHandler := handler.New(ctx, store, stacClient, handler.HandlerOptions{
 		DefaultSearchWindowDays: cfg.STACSearchWindowDays,
 		MaxAOICloudCover:        cfg.MaxAOICloudCover,
 		MaxRenderAttempts:       cfg.MaxRenderAttempts,

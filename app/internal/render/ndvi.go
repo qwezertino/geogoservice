@@ -218,36 +218,6 @@ func colorMapFromStops(stops []PaletteStop) func(float32) color.RGBA {
 	}
 }
 
-// RenderPNG converts an NDVI float32 buffer (row-major, width×height) into a
-// colour-mapped PNG byte slice using the project colour map.
-// If maskPoly contains at least 3 pixel-space points, pixels outside the
-// polygon are made fully transparent before encoding.
-func RenderPNG(ndvi []float32, width, height int, maskPoly [][2]float64) ([]byte, error) {
-	if len(ndvi) != width*height {
-		return nil, fmt.Errorf("ndvi buffer length %d != width*height (%d×%d=%d)",
-			len(ndvi), width, height, width*height)
-	}
-
-	colorMap := colorMapFromStops(DefaultPalette("ndvi"))
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			idx := y*width + x
-			img.SetRGBA(x, y, colorMap(ndvi[idx]))
-		}
-	}
-
-	if len(maskPoly) >= 3 {
-		applyPolygonMask(img, maskPoly)
-	}
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return nil, fmt.Errorf("encode PNG: %w", err)
-	}
-	return buf.Bytes(), nil
-}
-
 // applyPolygonMask sets the alpha of every pixel whose centre falls outside
 // poly (pixel-space coordinates) to zero (fully transparent).
 func applyPolygonMask(img *image.RGBA, poly [][2]float64) {
@@ -415,16 +385,20 @@ func RenderTCIPNG(red, green, blue []float32, width, height int, maskPoly [][2]f
 	if len(red) != n || len(green) != n || len(blue) != n {
 		return nil, fmt.Errorf("band slice lengths must all be %d", n)
 	}
-	norm := func(band []float32) []float32 {
-		cp := make([]float32, len(band))
+	// Shared sort buffer — reused for all three channels to avoid 3 extra allocs.
+	cp := make([]float32, n)
+	// Output slices packed into a single allocation.
+	outBuf := make([]float32, n*3)
+	r, g, b := outBuf[:n], outBuf[n:2*n], outBuf[2*n:]
+
+	norm := func(band, out []float32) {
 		copy(cp, band)
 		sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-		lo := cp[int(float64(len(cp))*0.02)]
-		hi := cp[int(float64(len(cp))*0.98)]
+		lo := cp[int(float64(n)*0.02)]
+		hi := cp[int(float64(n)*0.98)]
 		if hi == lo {
 			hi = lo + 1
 		}
-		out := make([]float32, len(band))
 		for i, v := range band {
 			t := (v - lo) / (hi - lo)
 			if t < 0 {
@@ -434,11 +408,10 @@ func RenderTCIPNG(red, green, blue []float32, width, height int, maskPoly [][2]f
 			}
 			out[i] = t
 		}
-		return out
 	}
-	r := norm(red)
-	g := norm(green)
-	b := norm(blue)
+	norm(red, r)
+	norm(green, g)
+	norm(blue, b)
 
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {

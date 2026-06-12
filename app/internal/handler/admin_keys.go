@@ -32,7 +32,10 @@ func (rh *RenderHandler) ServeCreateAPIKey(w http.ResponseWriter, r *http.Reques
 		Label string `json:"label"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
 	}
 
 	token, err := generateToken()

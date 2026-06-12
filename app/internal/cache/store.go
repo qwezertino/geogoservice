@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -106,8 +107,7 @@ func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexTyp
 		date, indexType, w, h, polygonHash, paletteHash,
 	).Scan(&key)
 	if err != nil {
-		// pgx returns pgx.ErrNoRows which is not a db error
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("cache lookup: %w", err)
@@ -434,7 +434,7 @@ func (s *Store) GetTileByKey(ctx context.Context, minioKey string) (*TileRenderP
 		&date, &rec.W, &rec.H, &rec.PolygonHash,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get tile by key: %w", err)
@@ -569,7 +569,7 @@ func (s *Store) GetJob(ctx context.Context, id string) (*Job, error) {
 		&job.ID, &job.Status, &job.Done, &job.Total, &errorsJSON, &job.CreatedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get job %s: %w", id, err)
@@ -606,7 +606,7 @@ func (s *Store) GetJobParams(ctx context.Context, id string) (*JobParams, error)
 		&p.StartDate, &p.EndDate, &p.W, &p.H, &p.PolygonHash, &p.PaletteHash,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get job params %s: %w", id, err)
@@ -852,7 +852,7 @@ func (s *Store) GetAPIKeyByToken(ctx context.Context, token string) (*APIKey, er
 	var k APIKey
 	row := s.db.QueryRow(ctx, q, token)
 	if err := row.Scan(&k.ID, &k.Token, &k.Label, &k.Settings, &k.IsActive, &k.CreatedAt, &k.LastUsedAt); err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get api key: %w", err)

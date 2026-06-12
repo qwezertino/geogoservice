@@ -64,8 +64,6 @@ services:
   # MinIO itself lives in the separate minio-infra project.
   minio-init:
     image: minio/mc:latest
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
       MINIO_ENDPOINT: ${MINIO_ENDPOINT}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
@@ -85,7 +83,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    command: redis-server --maxmemory 512mb --maxmemory-policy volatile-lru --save ""
     expose:
       - "6379"
     healthcheck:
@@ -98,8 +96,6 @@ services:
   gogeoapp:
     build: ./app
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
       <<: *app-env
     depends_on:
@@ -109,6 +105,8 @@ services:
         condition: service_healthy
     expose:
       - "8080"
+    labels:
+      logging.service: "gogeoapp"
   # ── Nginx load balancer ─────────────────────────────────────────────────────
   nginx:
     image: nginx:1.25-alpine

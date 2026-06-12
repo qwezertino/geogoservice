@@ -65,6 +65,7 @@ func (rh *RenderHandler) ServeBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<20) // 8 MB
 	var requests []BatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&requests); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -130,6 +131,9 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	}
 	if req.W <= 0 || req.H <= 0 {
 		return BatchResult{Index: idx, Error: "w and h must be positive"}
+	}
+	if len(req.Polygon) > maxPolygonVertices {
+		return BatchResult{Index: idx, Error: fmt.Sprintf("polygon exceeds limit of %d vertices", maxPolygonVertices)}
 	}
 
 	bbox := geo.BBox{
