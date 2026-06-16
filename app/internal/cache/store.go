@@ -1,5 +1,5 @@
-// Package cache manages the PostgreSQL tile index, MinIO object storage,
-// and the Redis L2 cache that sits in front of MinIO.
+// Package cache manages the PostgreSQL tile index, S3-compatible object
+// storage, and the Redis L2 cache that sits in front of it.
 package cache
 
 import (
@@ -15,7 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/minio/minio-go/v7"
+	s3sdk "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/qwezert/geogoservice/internal/config"
 	"github.com/qwezert/geogoservice/internal/geo"
@@ -27,27 +27,27 @@ const (
 	redisJobTTL = 24 * time.Hour // job-rendered tiles — hot data, keep longer
 )
 
-// Store wraps the PostgreSQL connection pool, MinIO client, and Redis client.
+// Store wraps the PostgreSQL connection pool, S3 client, and Redis client.
 type Store struct {
 	db     *pgxpool.Pool
-	minio  *minio.Client
+	s3     *s3sdk.Client
 	rdb    *redis.Client // L2 cache; nil if Redis is disabled
 	bucket string
 }
 
-// New connects to PostgreSQL, MinIO, and optionally Redis.
+// New connects to PostgreSQL, S3, and optionally Redis.
 func New(ctx context.Context, cfg *config.Config) (*Store, error) {
 	pool, err := pgxpool.New(ctx, cfg.DSN())
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
 
-	mc, err := minio.New(cfg.MinioEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.MinioAccessKey, cfg.MinioSecretKey, ""),
-		Secure: cfg.MinioUseSSL,
+	mc, err := s3sdk.New(cfg.S3Endpoint, &s3sdk.Options{
+		Creds:  credentials.NewStaticV4(cfg.S3AccessKey, cfg.S3SecretKey, ""),
+		Secure: cfg.S3UseSSL,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create minio client: %w", err)
+		return nil, fmt.Errorf("create s3 client: %w", err)
 	}
 
 	var rdb *redis.Client
@@ -63,7 +63,7 @@ func New(ctx context.Context, cfg *config.Config) (*Store, error) {
 		fmt.Println("[cache] Redis L2 enabled:", cfg.RedisURL)
 	}
 
-	return &Store{db: pool, minio: mc, rdb: rdb, bucket: cfg.MinioBucket}, nil
+	return &Store{db: pool, s3: mc, rdb: rdb, bucket: cfg.S3Bucket}, nil
 }
 
 // Close releases all connections.
@@ -76,7 +76,7 @@ func (s *Store) Close() {
 
 // LookupResult is returned by Lookup when a cached tile is found.
 type LookupResult struct {
-	MinioKey string
+	S3Key string
 }
 
 // Lookup checks whether a tile for the given parameters already exists in the
@@ -87,7 +87,7 @@ type LookupResult struct {
 // on a miss, or (nil, false, err) on a database error.
 func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexType string, w, h int, polygonHash, paletteHash string) (*LookupResult, bool, error) {
 	const q = `
-		SELECT minio_key
+		SELECT s3_key
 		FROM   tile_cache
 		WHERE  bbox_3857_minx = $1
 		  AND  bbox_3857_miny = $2
@@ -112,10 +112,10 @@ func (s *Store) Lookup(ctx context.Context, bbox geo.BBox, date string, indexTyp
 		}
 		return nil, false, fmt.Errorf("cache lookup: %w", err)
 	}
-	return &LookupResult{MinioKey: key}, true, nil
+	return &LookupResult{S3Key: key}, true, nil
 }
 
-// GetObject returns the PNG bytes for a MinIO key.
+// GetObject returns the PNG bytes for a S3 key.
 // If Redis is enabled, it checks L2 first and populates it on a miss.
 func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 	// L2: Redis
@@ -125,16 +125,16 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 		}
 	}
 
-	// L3: MinIO
-	obj, err := s.minio.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	// L3: S3
+	obj, err := s.s3.GetObject(ctx, s.bucket, key, s3sdk.GetObjectOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("minio get %q: %w", key, err)
+		return nil, fmt.Errorf("s3 get %q: %w", key, err)
 	}
 	defer obj.Close()
 
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(obj); err != nil {
-		return nil, fmt.Errorf("read minio object %q: %w", key, err)
+		return nil, fmt.Errorf("read s3 object %q: %w", key, err)
 	}
 	data := buf.Bytes()
 
@@ -150,7 +150,7 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
-// SaveAsync uploads pngBytes to MinIO and inserts a metadata record in
+// SaveAsync uploads pngBytes to S3 and inserts a metadata record in
 // PostgreSQL asynchronously. polygonHash is "" for plain tiles and an 8-char
 // hex string for polygon-masked tiles. statsJSON is the JSON-encoded TileStats
 // (may be nil). cloud is the scene-level cloud cover fraction (0–100). Errors
@@ -163,16 +163,16 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 
 		key := BuildKey(tokenPrefix, bbox, date, indexType, w, h, polygonHash, paletteHash)
 
-		_, err := s.minio.PutObject(ctx, s.bucket, key,
+		_, err := s.s3.PutObject(ctx, s.bucket, key,
 			bytes.NewReader(pngBytes), int64(len(pngBytes)),
-			minio.PutObjectOptions{ContentType: "image/png"},
+			s3sdk.PutObjectOptions{ContentType: "image/png"},
 		)
 		if err != nil {
-			fmt.Printf("[cache] minio upload error key=%s: %v\n", key, err)
+			fmt.Printf("[cache] s3 upload error key=%s: %v\n", key, err)
 			return
 		}
 
-		// Populate Redis L2 after a successful MinIO upload.
+		// Populate Redis L2 after a successful S3 upload.
 		if s.rdb != nil {
 			if err := s.rdb.Set(ctx, key, pngBytes, redisTTL).Err(); err != nil {
 				fmt.Printf("[cache] redis set error key=%s: %v\n", key, err)
@@ -187,11 +187,11 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 			for i, v := range ndviRaw {
 				binary.LittleEndian.PutUint32(rawBuf[i*4:], math.Float32bits(v))
 			}
-			if _, putErr := s.minio.PutObject(ctx, s.bucket, rawKey,
+			if _, putErr := s.s3.PutObject(ctx, s.bucket, rawKey,
 				bytes.NewReader(rawBuf), int64(len(rawBuf)),
-				minio.PutObjectOptions{ContentType: "application/octet-stream"},
+				s3sdk.PutObjectOptions{ContentType: "application/octet-stream"},
 			); putErr != nil {
-				fmt.Printf("[cache] minio put raw %q: %v\n", rawKey, putErr)
+				fmt.Printf("[cache] s3 put raw %q: %v\n", rawKey, putErr)
 			}
 		}
 
@@ -203,7 +203,7 @@ func (s *Store) SaveAsync(bbox geo.BBox, date, indexType string, w, h int, pngBy
 		const ins = `
 			INSERT INTO tile_cache
 				(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-				 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash, palette_hash,
+				 date_acquired, index_type, width, height, s3_bucket, s3_key, polygon_hash, palette_hash,
 				 stats, cloud)
 			VALUES
 				(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,$12,
@@ -232,7 +232,7 @@ type TileRecord struct {
 	DateAcquired string  `json:"date_acquired"`
 	Width        int     `json:"width"`
 	Height       int     `json:"height"`
-	MinioKey     string  `json:"minio_key"`
+	S3Key     string  `json:"s3_key"`
 }
 
 // ListTilesByYear returns cached NDVI tiles for the given year that intersect
@@ -241,7 +241,7 @@ type TileRecord struct {
 func (s *Store) ListTilesByYear(ctx context.Context, year int, bbox [4]float64) ([]TileRecord, error) {
 	const q = `
 		SELECT bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-		       date_acquired::text, width, height, minio_key
+		       date_acquired::text, width, height, s3_key
 		FROM   tile_cache
 		WHERE  EXTRACT(YEAR FROM date_acquired) = $1
 		  AND  index_type = 'ndvi'
@@ -260,7 +260,7 @@ func (s *Store) ListTilesByYear(ctx context.Context, year int, bbox [4]float64) 
 		var r TileRecord
 		if err := rows.Scan(
 			&r.BBoxMinX, &r.BBoxMinY, &r.BBoxMaxX, &r.BBoxMaxY,
-			&r.DateAcquired, &r.Width, &r.Height, &r.MinioKey,
+			&r.DateAcquired, &r.Width, &r.Height, &r.S3Key,
 		); err != nil {
 			return nil, fmt.Errorf("scan tile record: %w", err)
 		}
@@ -272,41 +272,41 @@ func (s *Store) ListTilesByYear(ctx context.Context, year int, bbox [4]float64) 
 	return results, nil
 }
 
-// DeleteTile removes a tile from MinIO, PostgreSQL, and Redis (if enabled).
+// DeleteTile removes a tile from S3, PostgreSQL, and Redis (if enabled).
 // The companion .ndvi.bin raw object is also removed when present.
 // It is safe to call even if the tile does not exist in one of the stores.
-func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
-	// 1. MinIO — PNG + companion raw binary.
-	if err := s.minio.RemoveObject(ctx, s.bucket, minioKey, minio.RemoveObjectOptions{}); err != nil {
-		return fmt.Errorf("minio remove %q: %w", minioKey, err)
+func (s *Store) DeleteTile(ctx context.Context, s3Key string) error {
+	// 1. S3 — PNG + companion raw binary.
+	if err := s.s3.RemoveObject(ctx, s.bucket, s3Key, s3sdk.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("s3 remove %q: %w", s3Key, err)
 	}
 	// Best-effort removal of companion; non-fatal if absent.
-	_ = s.minio.RemoveObject(ctx, s.bucket, NDVIRawKey(minioKey), minio.RemoveObjectOptions{})
+	_ = s.s3.RemoveObject(ctx, s.bucket, NDVIRawKey(s3Key), s3sdk.RemoveObjectOptions{})
 
 	// 2. PostgreSQL
-	const del = `DELETE FROM tile_cache WHERE minio_key = $1`
-	if _, err := s.db.Exec(ctx, del, minioKey); err != nil {
-		return fmt.Errorf("db delete %q: %w", minioKey, err)
+	const del = `DELETE FROM tile_cache WHERE s3_key = $1`
+	if _, err := s.db.Exec(ctx, del, s3Key); err != nil {
+		return fmt.Errorf("db delete %q: %w", s3Key, err)
 	}
 
 	// 3. Redis
 	if s.rdb != nil {
-		if err := s.rdb.Del(ctx, minioKey).Err(); err != nil {
+		if err := s.rdb.Del(ctx, s3Key).Err(); err != nil {
 			// Non-fatal — tile is already gone from the primary stores.
-			fmt.Printf("[cache] redis del %q: %v\n", minioKey, err)
+			fmt.Printf("[cache] redis del %q: %v\n", s3Key, err)
 		}
 	}
 
 	return nil
 }
 
-// Save uploads pngBytes to MinIO, populates Redis L2, and inserts a metadata
+// Save uploads pngBytes to S3, populates Redis L2, and inserts a metadata
 // record in PostgreSQL. Unlike SaveAsync it runs synchronously and returns any
 // error — use this in background workers where you need to know whether the
 // tile was actually persisted before continuing.
 //
 // ndviRaw is the raw float32 index buffer (length = w*h). When non-nil, it is
-// stored as a companion object in MinIO so that GET /api/ndvi-raw can serve
+// stored as a companion object in S3 so that GET /api/ndvi-raw can serve
 // pixel-level values without re-rendering.
 //
 // statsJSON is the JSON-encoded render.TileStats (nil when not applicable, e.g.
@@ -314,12 +314,12 @@ func (s *Store) DeleteTile(ctx context.Context, minioKey string) error {
 func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string, w, h int, pngBytes []byte, ndviRaw []float32, polygonHash, tokenPrefix, paletteHash string, statsJSON []byte, cloud float64) error {
 	key := BuildKey(tokenPrefix, bbox, date, indexType, w, h, polygonHash, paletteHash)
 
-	_, err := s.minio.PutObject(ctx, s.bucket, key,
+	_, err := s.s3.PutObject(ctx, s.bucket, key,
 		bytes.NewReader(pngBytes), int64(len(pngBytes)),
-		minio.PutObjectOptions{ContentType: "image/png"},
+		s3sdk.PutObjectOptions{ContentType: "image/png"},
 	)
 	if err != nil {
-		return fmt.Errorf("minio put %q: %w", key, err)
+		return fmt.Errorf("s3 put %q: %w", key, err)
 	}
 
 	if s.rdb != nil {
@@ -335,13 +335,13 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 		for i, v := range ndviRaw {
 			binary.LittleEndian.PutUint32(rawBuf[i*4:], math.Float32bits(v))
 		}
-		_, putErr := s.minio.PutObject(ctx, s.bucket, rawKey,
+		_, putErr := s.s3.PutObject(ctx, s.bucket, rawKey,
 			bytes.NewReader(rawBuf), int64(len(rawBuf)),
-			minio.PutObjectOptions{ContentType: "application/octet-stream"},
+			s3sdk.PutObjectOptions{ContentType: "application/octet-stream"},
 		)
 		if putErr != nil {
 			// Non-fatal — PNG is already saved; raw data is best-effort.
-			fmt.Printf("[cache] minio put raw %q: %v\n", rawKey, putErr)
+			fmt.Printf("[cache] s3 put raw %q: %v\n", rawKey, putErr)
 		}
 	}
 
@@ -353,7 +353,7 @@ func (s *Store) Save(ctx context.Context, bbox geo.BBox, date, indexType string,
 	const ins = `
 		INSERT INTO tile_cache
 			(bbox_geom, bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
-			 date_acquired, index_type, width, height, minio_bucket, minio_key, polygon_hash, palette_hash,
+			 date_acquired, index_type, width, height, s3_bucket, s3_key, polygon_hash, palette_hash,
 			 stats, cloud)
 		VALUES
 			(ST_Transform(ST_MakeEnvelope($1,$2,$3,$4,3857), 4326), $1,$2,$3,$4, $5,$6,$7,$8, $9,$10, $11,$12,
@@ -383,7 +383,7 @@ func DecodeRawFloat32(b []byte) []float32 {
 	return out
 }
 
-// NDVIRawKey returns the MinIO key for the companion float32 binary of a PNG tile.
+// NDVIRawKey returns the S3 key for the companion float32 binary of a PNG tile.
 func NDVIRawKey(pngKey string) string {
 	// Strip .png suffix if present and append .ndvi.bin
 	if len(pngKey) > 4 && pngKey[len(pngKey)-4:] == ".png" {
@@ -393,13 +393,13 @@ func NDVIRawKey(pngKey string) string {
 }
 
 // GetNDVIRaw returns the raw float32 NDVI buffer for a tile identified by its
-// PNG minio_key. Returns the little-endian float32 bytes directly so the HTTP
+// PNG s3_key. Returns the little-endian float32 bytes directly so the HTTP
 // handler can stream them without extra allocation.
 func (s *Store) GetNDVIRaw(ctx context.Context, pngKey string) ([]byte, error) {
 	rawKey := NDVIRawKey(pngKey)
-	obj, err := s.minio.GetObject(ctx, s.bucket, rawKey, minio.GetObjectOptions{})
+	obj, err := s.s3.GetObject(ctx, s.bucket, rawKey, s3sdk.GetObjectOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("minio get raw %q: %w", rawKey, err)
+		return nil, fmt.Errorf("s3 get raw %q: %w", rawKey, err)
 	}
 	defer obj.Close()
 	var buf bytes.Buffer
@@ -417,19 +417,19 @@ type TileRenderParams struct {
 	PolygonHash string
 }
 
-// GetTileByKey looks up tile parameters from the PostgreSQL cache by minio_key.
+// GetTileByKey looks up tile parameters from the PostgreSQL cache by s3_key.
 // Used to re-render raw NDVI data for tiles that predate the .ndvi.bin feature.
-func (s *Store) GetTileByKey(ctx context.Context, minioKey string) (*TileRenderParams, error) {
+func (s *Store) GetTileByKey(ctx context.Context, s3Key string) (*TileRenderParams, error) {
 	const q = `
 		SELECT bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy,
 		       date_acquired::text, width, height, polygon_hash
 		FROM   tile_cache
-		WHERE  minio_key = $1
+		WHERE  s3_key = $1
 		LIMIT  1`
 
 	var rec TileRenderParams
 	var date string
-	err := s.db.QueryRow(ctx, q, minioKey).Scan(
+	err := s.db.QueryRow(ctx, q, s3Key).Scan(
 		&rec.BBox.MinX, &rec.BBox.MinY, &rec.BBox.MaxX, &rec.BBox.MaxY,
 		&date, &rec.W, &rec.H, &rec.PolygonHash,
 	)
@@ -444,15 +444,15 @@ func (s *Store) GetTileByKey(ctx context.Context, minioKey string) (*TileRenderP
 }
 
 // SaveNDVIRawAsync stores a raw float32 NDVI buffer as a companion .ndvi.bin
-// object in MinIO. Runs in a background goroutine — errors are logged only.
+// object in S3. Runs in a background goroutine — errors are logged only.
 func (s *Store) SaveNDVIRawAsync(pngKey string, rawBytes []byte) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		rawKey := NDVIRawKey(pngKey)
-		_, err := s.minio.PutObject(ctx, s.bucket, rawKey,
+		_, err := s.s3.PutObject(ctx, s.bucket, rawKey,
 			bytes.NewReader(rawBytes), int64(len(rawBytes)),
-			minio.PutObjectOptions{ContentType: "application/octet-stream"},
+			s3sdk.PutObjectOptions{ContentType: "application/octet-stream"},
 		)
 		if err != nil {
 			fmt.Printf("[cache] SaveNDVIRawAsync %q: %v\n", rawKey, err)
@@ -619,7 +619,7 @@ func (s *Store) GetJobParams(ctx context.Context, id string) (*JobParams, error)
 type JobTileResult struct {
 	Date       string          `json:"date"`
 	Index      string          `json:"index"`
-	MinioKey   string          `json:"minio_key"`
+	S3Key   string          `json:"s3_key"`
 	CloudCover float64         `json:"cloud_cover"`
 	Stats      json.RawMessage `json:"stats,omitempty"` // raw JSON, may be null
 	BBox       [4]float64      `json:"bbox"`            // [minx, miny, maxx, maxy] EPSG:3857
@@ -631,7 +631,7 @@ type JobTileResult struct {
 // soft-farm can render charts without additional requests.
 func (s *Store) ListJobTilesWithStats(ctx context.Context, p *JobParams) ([]JobTileResult, error) {
 	const q = `
-		SELECT date_acquired::text, index_type, minio_key,
+		SELECT date_acquired::text, index_type, s3_key,
 		       COALESCE(cloud, 0),
 		       stats,
 		       bbox_3857_minx, bbox_3857_miny, bbox_3857_maxx, bbox_3857_maxy
@@ -660,7 +660,7 @@ func (s *Store) ListJobTilesWithStats(ctx context.Context, p *JobParams) ([]JobT
 		var statsRaw []byte
 		var bboxMinX, bboxMinY, bboxMaxX, bboxMaxY float64
 		if err := rows.Scan(
-			&r.Date, &r.Index, &r.MinioKey,
+			&r.Date, &r.Index, &r.S3Key,
 			&r.CloudCover,
 			&statsRaw,
 			&bboxMinX, &bboxMinY, &bboxMaxX, &bboxMaxY,
@@ -683,7 +683,7 @@ func (s *Store) ListJobTilesWithStats(ctx context.Context, p *JobParams) ([]JobT
 type AlternatePaletteTile struct {
 	Date        string
 	Index       string
-	OldMinioKey string
+	OldS3Key string
 	CloudCover  float64
 	Stats       json.RawMessage
 }
@@ -699,7 +699,7 @@ func (s *Store) FindAlternatePaletteTiles(
 	targetPaletteHash string,
 ) ([]AlternatePaletteTile, error) {
 	const q = `
-		SELECT tc.date_acquired::text, tc.index_type, tc.minio_key,
+		SELECT tc.date_acquired::text, tc.index_type, tc.s3_key,
 		       COALESCE(tc.cloud, 0), tc.stats
 		FROM   tile_cache tc
 		WHERE  tc.bbox_3857_minx = $1 AND tc.bbox_3857_miny = $2
@@ -737,7 +737,7 @@ func (s *Store) FindAlternatePaletteTiles(
 	for rows.Next() {
 		var t AlternatePaletteTile
 		var statsRaw []byte
-		if err := rows.Scan(&t.Date, &t.Index, &t.OldMinioKey, &t.CloudCover, &statsRaw); err != nil {
+		if err := rows.Scan(&t.Date, &t.Index, &t.OldS3Key, &t.CloudCover, &statsRaw); err != nil {
 			return nil, fmt.Errorf("scan alternate palette tile: %w", err)
 		}
 		if len(statsRaw) > 0 {
@@ -939,13 +939,13 @@ func (s *Store) TouchAPIKeyLastUsed(ctx context.Context, token string) {
 	}()
 }
 
-// BuildKey creates a deterministic MinIO object key from the tile parameters.
+// BuildKey creates a deterministic S3 object key from the tile parameters.
 // If polygonHash is non-empty it is appended to the filename, distinguishing
 // polygon-masked tiles from the plain tile with the same bbox/date/dimensions.
 // Exported so workers can construct the result URL before SaveAsync completes.
-// TokenPrefix returns the MinIO path prefix for a given API key as
+// TokenPrefix returns the S3 path prefix for a given API key as
 // "<id>-<sanitized-label>/". This keeps each token's tiles in a distinct
-// folder that is both unique (id) and human-readable (label) in the MinIO
+// folder that is both unique (id) and human-readable (label) in the S3
 // browser. Returns "" when id <= 0 (anonymous / legacy tiles).
 func TokenPrefix(id int64, label string) string {
 	if id <= 0 {

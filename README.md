@@ -11,7 +11,7 @@ geogoservice/
 │   │   ├── main.go           # Entry point; runs DB migrations on startup
 │   │   └── migrations/       # SQL files embedded into the binary
 │   ├── internal/
-│   │   ├── cache/        # PostGIS + MinIO + Redis tile cache
+│   │   ├── cache/        # PostGIS + S3 + Redis tile cache
 │   │   ├── config/       # Env-based configuration
 │   │   ├── geo/          # GDAL reader, CRS transforms, polygon masking
 │   │   ├── handler/      # HTTP handlers (render, batch, catalog, delete)
@@ -24,7 +24,7 @@ geogoservice/
 ├── nginx/                # Nginx load-balancer config
 ├── data/                 # Runtime data (gitignored)
 │   ├── postgres/         # PostGIS volume
-│   └── minio/            # MinIO volume
+│   (S3 storage lives in the separate seaweedfs-infra project)
 ├── docker-compose.yml
 ├── Makefile
 └── .env.example
@@ -44,7 +44,7 @@ Nginx :80  (load balancer, re-resolves Docker DNS every 5 s)
             │
             ├── Redis            (L2 in-memory cache, TTL 1 h)
             ├── PostGIS          (tile index, spatial queries)
-            ├── MinIO            (PNG object storage)
+            ├── S3 storage         (PNG object storage, e.g. SeaweedFS)
             └── STAC providers   (satellite imagery — only on cache miss)
                  ├── Planetary Computer  (preferred, SAS token cache)
                  └── AWS Earth Search    (public S3, no auth, fallback)
@@ -52,12 +52,12 @@ Nginx :80  (load balancer, re-resolves Docker DNS every 5 s)
 
 **Render pipeline (cache miss):**
 1. Transform bbox EPSG:3857 → EPSG:4326
-2. Check Redis → check PostGIS → if hit, return PNG from MinIO immediately
+2. Check Redis → check PostGIS → if hit, return PNG from S3 immediately
 3. Query STAC API for least-cloudy Sentinel-2 scene (tries preferred provider first, auto-falls back)
 4. Read only required pixels from COG via GDAL `/vsicurl/` (HTTP Range requests)
 5. Compute NDVI = (NIR − Red) / (NIR + Red)
 6. Apply colour map → if `polygon` supplied, mask pixels outside the polygon → encode PNG
-7. Async upload to MinIO + insert index record in PostGIS + write to Redis
+7. Async upload to S3 + insert index record in PostGIS + write to Redis
 8. Return PNG to client
 
 **DB migrations** run automatically on every container startup via `golang-migrate`. SQL files are embedded in the binary — no external tooling needed.
@@ -82,7 +82,7 @@ cp .env.example .env
 make up
 ```
 
-Wait ~15 seconds for PostGIS and MinIO to become healthy, then verify:
+Wait ~15 seconds for PostGIS and S3 storage to become healthy, then verify:
 
 ```bash
 make ps
@@ -142,7 +142,7 @@ curl "http://localhost/api/render?bbox=3430000,5872000,3432000,5874000&date=2026
 
 Renders multiple tiles in parallel and returns all results at once. Intended for NDVI viewers that need to load 10–20 tiles simultaneously — all tiles appear at the same time.
 
-**When `minio_key` is provided the tile is fetched directly from cache (MinIO/Redis) — no STAC call is made.** Use this for the catalog-viewer flow.
+**When `s3_key` is provided the tile is fetched directly from cache (S3/Redis) — no STAC call is made.** Use this for the catalog-viewer flow.
 
 **Concurrent GDAL renders are capped at `RENDER_WORKERS` (default: `NumCPU`).**
 **Maximum batch size: 100 tiles.**
@@ -155,8 +155,8 @@ JSON array of tile descriptors. Two usage modes:
 
 ```json
 [
-  {"minio_key": "ndvi/2026-04-01/3430440_..._512x398.png"},
-  {"minio_key": "ndvi/2026-04-02/3430440_..._512x398.png"}
+  {"s3_key": "ndvi/2026-04-01/3430440_..._512x398.png"},
+  {"s3_key": "ndvi/2026-04-02/3430440_..._512x398.png"}
 ]
 ```
 
@@ -173,8 +173,8 @@ JSON array of tile descriptors. Two usage modes:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `minio_key` | `string` | — | Object key from `GET /api/catalog`. If present, all other fields are ignored |
-| `bbox` | `[4]float64` | yes* | `[minX, minY, maxX, maxY]` in EPSG:3857. *Required when `minio_key` is absent |
+| `s3_key` | `string` | — | Object key from `GET /api/catalog`. If present, all other fields are ignored |
+| `bbox` | `[4]float64` | yes* | `[minX, minY, maxX, maxY]` in EPSG:3857. *Required when `s3_key` is absent |
 | `date` | `string` | yes* | `YYYY-MM-DD` |
 | `index` | `string` | yes* | `"ndvi"` |
 | `w` | `int` | yes* | Width in pixels (1–2048) |
@@ -217,7 +217,7 @@ JSON array (never `null` — empty array when no results):
 ```json
 [
   {
-    "minio_key":     "ndvi/2026-04-01/3430440_5873412_..._512x398.png",
+    "s3_key":     "ndvi/2026-04-01/3430440_5873412_..._512x398.png",
     "date_acquired": "2026-04-01",
     "index_type":    "ndvi",
     "width":         512,
@@ -230,7 +230,7 @@ JSON array (never `null` — empty array when no results):
 ]
 ```
 
-Pass the `minio_key` values straight into `POST /api/render/batch` to load tiles without any STAC calls.
+Pass the `s3_key` values straight into `POST /api/render/batch` to load tiles without any STAC calls.
 
 - `200 OK` — JSON array
 - `400 Bad Request` — invalid year or bbox
@@ -246,13 +246,13 @@ curl "http://localhost/api/catalog?year=2026&bbox=30.8,46.2,31.2,46.6"
 
 ### `DELETE /api/tiles`
 
-Removes a single tile from MinIO, PostgreSQL, and Redis.
+Removes a single tile from S3, PostgreSQL, and Redis.
 
 #### Parameters
 
 | Parameter | Description |
 |-----------|-------------|
-| `key` | `minio_key` value from `GET /api/catalog` |
+| `key` | `s3_key` value from `GET /api/catalog` |
 
 #### Response
 
@@ -272,10 +272,10 @@ curl -X DELETE "http://localhost/api/tiles?key=ndvi/2026-04-01/3430440_..._512x3
 
 ```
 1. GET /api/catalog?year=2026&bbox=<viewport WGS-84>
-      → returns list of tiles with minio_key
+      → returns list of tiles with s3_key
 
 2. POST /api/render/batch
-      body: [{"minio_key": "..."}, {"minio_key": "..."}, ...]
+      body: [{"s3_key": "..."}, {"s3_key": "..."}, ...]
       → returns base64 PNGs for all tiles at once, fetched from cache only
         (no STAC calls, no rendering)
 
@@ -315,11 +315,11 @@ Set `STAC_PROVIDER` in `.env` to change the preferred provider. Fallback is auto
 | `DB_USER` | — | PostGIS user |
 | `DB_PASSWORD` | — | PostGIS password |
 | `DB_NAME` | — | PostGIS database name |
-| `MINIO_ENDPOINT` | — | MinIO host:port |
-| `MINIO_ACCESS_KEY` | — | MinIO access key |
-| `MINIO_SECRET_KEY` | — | MinIO secret key |
-| `MINIO_BUCKET` | — | MinIO bucket name |
-| `MINIO_USE_SSL` | `false` | Use TLS for MinIO |
+| `S3_ENDPOINT` | — | S3 host:port |
+| `S3_ACCESS_KEY` | — | S3 access key |
+| `S3_SECRET_KEY` | — | S3 secret key |
+| `S3_BUCKET` | — | S3 bucket name |
+| `S3_USE_SSL` | `false` | Use TLS for S3 |
 | `REDIS_URL` | — | Redis connection URL (`redis://host:port/db`). Redis is disabled if empty |
 | `STAC_PROVIDER` | `planetary-computer` | Preferred STAC provider |
 | `STAC_SEARCH_WINDOW_DAYS` | `15` | ±N day search radius around the requested date |
@@ -327,15 +327,13 @@ Set `STAC_PROVIDER` in `.env` to change the preferred provider. Fallback is auto
 | `RENDER_WORKERS` | `NumCPU` | Max parallel GDAL renders |
 | `HOST_PORT_HTTP` | `80` | Host port for Nginx |
 | `HOST_PORT_DB` | `5432` | Host port for PostgreSQL |
-| `HOST_PORT_MINIO` | `9000` | Host port for MinIO S3 API |
-| `HOST_PORT_MINIO_CONSOLE` | `9001` | Host port for MinIO Web UI |
 
 ---
 
 ## Performance benchmarks
 
 Tests run on a local developer machine with `STAC_PROVIDER=local` (synthetic
-COGs pre-loaded into MinIO, no external STAC calls).  All scenarios completed
+COGs pre-loaded into S3, no external STAC calls).  All scenarios completed
 with **0 % errors**.
 
 ### Results summary
@@ -343,12 +341,12 @@ with **0 % errors**.
 | Scenario | Replicas | VUs | req/s | p50 | p95 | p99 |
 |----------|----------|-----|-------|-----|-----|-----|
 | Warm cache — Redis L2 (single tile) | 3 | 1000 | **1 693** | 45 ms | 186 ms | 775 ms |
-| Warm cache — MinIO only (single tile) | 3 | 1000 | **930** | 92 ms | 647 ms | 2.1 s |
-| Warm cache — Redis + MinIO (60 unique tiles) | 10 | 1000 | **1 855** | 39 ms | 160 ms | 480 ms |
+| Warm cache — S3 only (single tile) | 3 | 1000 | **930** | 92 ms | 647 ms | 2.1 s |
+| Warm cache — Redis + S3 (60 unique tiles) | 10 | 1000 | **1 855** | 39 ms | 160 ms | 480 ms |
 | Cold render — no singleflight | 3 | 100 | **164** | 137 ms | 685 ms | — |
 | Cold render — with singleflight | 10 | 100 | **455** | 52 ms | 157 ms | — |
 
-### Warm cache — 10 replicas, 60 unique tiles (Redis + MinIO)
+### Warm cache — 10 replicas, 60 unique tiles (Redis + S3)
 
 ```
 http_req_duration..: avg=61ms  p(50)=39.61ms  p(95)=160.71ms  p(99)=480.66ms  max=3.78s
@@ -359,8 +357,8 @@ png_size_bytes.....: avg=99 300  min=98 774  max=99 993
 ```
 
 60 unique pre-warmed tiles, random selection per VU. Redis serves hot tiles
-from RAM; cold tiles fall through to MinIO. At 191 MB/s the bottleneck is
-MinIO I/O, not CPU.
+from RAM; cold tiles fall through to S3. At 191 MB/s the bottleneck is
+S3 I/O, not CPU.
 
 ### Warm cache — 3 replicas, single hot tile (Redis L2)
 
@@ -409,7 +407,7 @@ go tool pprof -http=:8888 'http://localhost:6060/debug/pprof/profile?seconds=30'
 ```
 
 CPU flame graphs show the cold-render bottleneck is split between GDAL HTTP
-range requests to MinIO and PNG encoding; NDVI math is negligible.
+range requests to S3 and PNG encoding; NDVI math is negligible.
 
 ---
 
@@ -438,11 +436,9 @@ Nginx automatically discovers new replicas via Docker DNS (re-resolves every 5 s
 
 ---
 
-## MinIO console
+## S3 admin console
 
-Browse cached tiles at **http://localhost:9001** (or your `HOST_PORT_MINIO_CONSOLE`).
-
-Login with `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` from your `.env`.
+The object store itself (SeaweedFS) lives in the separate `seaweedfs-infra` project — see its `docker-compose.yml` for the admin UI port and credentials.
 
 ---
 
@@ -459,4 +455,4 @@ docker compose logs -f gogeoapp
 docker compose down
 
 # Remove everything including data
-docker compose down -v && rm -rf ./data/postgres ./data/minio
+docker compose down -v && rm -rf ./data/postgres

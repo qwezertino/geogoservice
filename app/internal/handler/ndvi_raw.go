@@ -13,14 +13,14 @@ import (
 	"github.com/qwezert/geogoservice/internal/render"
 )
 
-// ServeNDVIRaw handles GET /api/ndvi-raw?key=<minio_key>.
+// ServeNDVIRaw handles GET /api/ndvi-raw?key=<s3_key>.
 //
 // Returns the raw float32 NDVI buffer for a tile as little-endian IEEE-754
 // bytes, row-major, length = W×H.
 //
 // Self-healing: if the companion .ndvi.bin was not saved when the tile was
 // originally rendered (tiles pre-dating this feature), the handler re-fetches
-// the satellite bands from STAC, recomputes NDVI, persists .ndvi.bin to MinIO,
+// the satellite bands from STAC, recomputes NDVI, persists .ndvi.bin to S3,
 // and returns the data — transparently to the caller.
 //
 // Cache-Control is set to immutable so browsers never re-request the same tile.
@@ -37,7 +37,7 @@ func (rh *RenderHandler) ServeNDVIRaw(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// ── Fast path: .ndvi.bin already in MinIO ────────────────────────────────
+	// ── Fast path: .ndvi.bin already in S3 ────────────────────────────────
 	rawBytes, err := rh.store.GetNDVIRaw(ctx, key)
 	if err == nil {
 		serveRawBytes(w, rawBytes)
@@ -118,7 +118,7 @@ func serveRawBytes(w http.ResponseWriter, data []byte) {
 	_, _ = w.Write(data)
 }
 
-// isNotFoundError returns true when the MinIO error indicates the object does
+// isNotFoundError returns true when the S3 error indicates the object does
 // not exist (NoSuchKey / 404).
 func isNotFoundError(err error) bool {
 	s := err.Error()

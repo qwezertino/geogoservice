@@ -5,11 +5,11 @@ x-app-env: &app-env
   DB_USER: ${DB_USER}
   DB_PASSWORD: ${DB_PASSWORD}
   DB_NAME: ${DB_NAME}
-  MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
-  MINIO_BUCKET: ${MINIO_BUCKET}
-  MINIO_USE_SSL: "false"
+  S3_ENDPOINT: ${S3_ENDPOINT}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY}
+  S3_BUCKET: ${S3_BUCKET}
+  S3_USE_SSL: "false"
   # GDAL env vars – allow /vsicurl/ to use the network
   REDIS_URL: redis://redis:6379/0
   GDAL_HTTP_UNSAFESSL: ${GDAL_HTTP_UNSAFESSL:-YES}
@@ -60,23 +60,22 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── MinIO bucket initializer (runs once, connects to external minio) ─────────
-  # MinIO itself lives in the separate minio-infra project.
-  minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1
+  # ── S3 bucket initializer (runs once, connects to external SeaweedFS) ────────
+  # Uses SeaweedFS's own `weed shell` (Apache-2.0, ships with the seaweedfs-infra
+  # image) instead of MinIO's `mc` client — no S3 credentials needed, since
+  # bucket creation goes through the master API directly, not the S3 gateway.
+  s3-init:
+    image: chrislusf/seaweedfs:latest
+    entrypoint: /bin/sh
     environment:
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
-      MINIO_BUCKET: ${MINIO_BUCKET:-ndvi-tiles}
-    entrypoint: >
-      /bin/sh -c "
-        until mc alias set local http://$$MINIO_ENDPOINT $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY; do
-          echo 'Waiting for MinIO...'; sleep 3;
-        done &&
-        mc mb --ignore-existing local/$$MINIO_BUCKET &&
-        mc anonymous set download local/$$MINIO_BUCKET
-      "
+      SEAWEED_MASTER: ${SEAWEED_MASTER:-seaweed:9333}
+      S3_BUCKET: ${S3_BUCKET:-ndvi-tiles}
+    command:
+      - -c
+      - >
+        until echo "s3.bucket.create -name $$S3_BUCKET" | weed shell -master=$$SEAWEED_MASTER; do
+          echo 'Waiting for SeaweedFS...'; sleep 3;
+        done
     restart: "on-failure"
     networks:
       - ndvi-go-net

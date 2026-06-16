@@ -27,11 +27,11 @@ type Config struct {
 	DBPassword string
 	DBName     string
 
-	MinioEndpoint  string
-	MinioAccessKey string
-	MinioSecretKey string
-	MinioBucket    string
-	MinioUseSSL    bool
+	S3Endpoint  string
+	S3AccessKey string
+	S3SecretKey string
+	S3Bucket    string
+	S3UseSSL    bool
 
 	// STACProvider controls which satellite data provider is tried first.
 	// Accepted values: "planetary-computer" (default), "earth-search", "cdse".
@@ -64,7 +64,7 @@ type Config struct {
 
 	// RedisURL is the connection URL for the Redis L2 tile cache.
 	// Format: redis://[user:password@]host:port/db
-	// If empty, Redis is disabled and tiles are always fetched from MinIO.
+	// If empty, Redis is disabled and tiles are always fetched from S3.
 	RedisURL string
 
 	// AdminToken protects /api/admin/* endpoints.
@@ -77,7 +77,7 @@ type Config struct {
 func Load() (*Config, error) {
 	required := []string{
 		"DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME",
-		"MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET",
+		"S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET",
 	}
 	for _, k := range required {
 		if os.Getenv(k) == "" {
@@ -85,13 +85,13 @@ func Load() (*Config, error) {
 		}
 	}
 
-	sslStr := os.Getenv("MINIO_USE_SSL")
+	sslStr := os.Getenv("S3_USE_SSL")
 	var useSSL bool
 	if sslStr != "" {
 		var sslErr error
 		useSSL, sslErr = strconv.ParseBool(sslStr)
 		if sslErr != nil {
-			return nil, fmt.Errorf("invalid MINIO_USE_SSL %q: must be true or false", sslStr)
+			return nil, fmt.Errorf("invalid S3_USE_SSL %q: must be true or false", sslStr)
 		}
 	}
 
@@ -133,11 +133,11 @@ func Load() (*Config, error) {
 		DBUser:               os.Getenv("DB_USER"),
 		DBPassword:           os.Getenv("DB_PASSWORD"),
 		DBName:               os.Getenv("DB_NAME"),
-		MinioEndpoint:        os.Getenv("MINIO_ENDPOINT"),
-		MinioAccessKey:       os.Getenv("MINIO_ACCESS_KEY"),
-		MinioSecretKey:       os.Getenv("MINIO_SECRET_KEY"),
-		MinioBucket:          os.Getenv("MINIO_BUCKET"),
-		MinioUseSSL:          useSSL,
+		S3Endpoint:           os.Getenv("S3_ENDPOINT"),
+		S3AccessKey:          os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:          os.Getenv("S3_SECRET_KEY"),
+		S3Bucket:             os.Getenv("S3_BUCKET"),
+		S3UseSSL:             useSSL,
 		STACProvider:         stacProvider,
 		STACSearchWindowDays: searchWindow,
 		MaxAOICloudCover:     maxAOICloud,

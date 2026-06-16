@@ -7,12 +7,12 @@ import (
 	"strings"
 )
 
-// ServeDelete handles DELETE /api/tiles?key=<minio_key>
+// ServeDelete handles DELETE /api/tiles?key=<s3_key>
 //
-// Removes the tile identified by its MinIO object key from all three stores:
-// MinIO, PostgreSQL, and Redis (if enabled).
+// Removes the tile identified by its S3 object key from all three stores:
+// S3, PostgreSQL, and Redis (if enabled).
 //
-// The minio_key is returned by GET /api/catalog in the "minio_key" field.
+// The s3_key is returned by GET /api/catalog in the "s3_key" field.
 //
 // Example:
 //

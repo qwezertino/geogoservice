@@ -241,7 +241,7 @@ func (rh *RenderHandler) ServeJobResults(w http.ResponseWriter, r *http.Request)
 //  1. Skip if a matching tile already exists in the cache.
 //  2. Perform AOI cloud check via SCL band (skips overclouded scenes).
 //  3. Render with render.RenderFromBands.
-//  4. Save PNG + raw values + stats + cloud cover to MinIO + PostgreSQL.
+//  4. Save PNG + raw values + stats + cloud cover to S3 + PostgreSQL.
 func (rh *RenderHandler) runJob(
 	jobID string,
 	bbox geo.BBox,
@@ -424,7 +424,7 @@ func (rh *RenderHandler) runJob(
 		pixelPoly = geo.PolygonToPixels(polygon, bbox, w, h)
 	}
 	for _, alt := range alternateTiles {
-		rawBytes, err := rh.store.GetNDVIRaw(ctx, alt.OldMinioKey)
+		rawBytes, err := rh.store.GetNDVIRaw(ctx, alt.OldS3Key)
 		if err != nil {
 			log.Printf("[job] %s: repalette %s/%s: get raw: %v (skip)", jobID, alt.Date, alt.Index, err)
 			_ = rh.store.IncrJobDone(ctx, jobID)
@@ -445,7 +445,7 @@ func (rh *RenderHandler) runJob(
 		); saveErr != nil {
 			log.Printf("[job] %s: repalette %s/%s: save: %v", jobID, alt.Date, alt.Index, saveErr)
 		} else {
-			if delErr := rh.store.DeleteTile(ctx, alt.OldMinioKey); delErr != nil {
+			if delErr := rh.store.DeleteTile(ctx, alt.OldS3Key); delErr != nil {
 				log.Printf("[job] %s: repalette %s/%s: delete old: %v", jobID, alt.Date, alt.Index, delErr)
 			}
 			log.Printf("[job] %s: repalette %s/%s: ok", jobID, alt.Date, alt.Index)

@@ -6,11 +6,11 @@ import (
 	"strings"
 )
 
-// ServeImage handles GET /api/images?key=<minio_key>.
+// ServeImage handles GET /api/images?key=<s3_key>.
 //
-// Streams the PNG stored in MinIO for the given key.
+// Streams the PNG stored in S3 for the given key.
 // Used as a proxy by the PHP backend so the frontend can display
-// job-rendered tiles without direct MinIO access.
+// job-rendered tiles without direct S3 access.
 //
 // Cache-Control is set to immutable — the key already encodes all render
 // parameters, so the content never changes.

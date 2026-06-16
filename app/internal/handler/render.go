@@ -123,9 +123,9 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if found {
-			pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
+			pngBytes, err := rh.store.GetObject(ctx, hit.S3Key)
 			if err != nil {
-				fmt.Printf("[handler] minio get failed, recomputing: %v\n", err)
+				fmt.Printf("[handler] s3 get failed, recomputing: %v\n", err)
 			} else {
 				writePNG(w, pngBytes)
 				return

@@ -27,7 +27,7 @@ func validatePolygonPoints(poly [][2]float64) error {
 	return nil
 }
 
-// tokenPrefixFor returns the MinIO path prefix for the given API key as
+// tokenPrefixFor returns the S3 path prefix for the given API key as
 // "<id>-<sanitized-label>/". Returns "" for nil key (pre-auth / legacy tiles).
 func tokenPrefixFor(key *cache.APIKey) string {
 	if key == nil {

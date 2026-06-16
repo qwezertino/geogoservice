@@ -86,17 +86,17 @@ func run() error {
 	mux.Handle("/api/render/batch", auth(http.HandlerFunc(renderHandler.ServeBatch)))
 
 	// Raw NDVI float32 data for pixel-level hover values on the frontend.
-	// GET /api/ndvi-raw?key=<minio_key> → little-endian float32 array (W×H)
+	// GET /api/ndvi-raw?key=<s3_key> → little-endian float32 array (W×H)
 	mux.Handle("GET /api/ndvi-raw", auth(http.HandlerFunc(renderHandler.ServeNDVIRaw)))
 
-	// PNG proxy for job-rendered tiles stored in MinIO.
-	// GET /api/images?key=<minio_key> → image/png
+	// PNG proxy for job-rendered tiles stored in S3.
+	// GET /api/images?key=<s3_key> → image/png
 	mux.Handle("GET /api/images", auth(http.HandlerFunc(renderHandler.ServeImage)))
 
 	// Catalog endpoint — GET returns JSON list of cached NDVI tiles from PostgreSQL.
 	mux.Handle("/api/catalog", auth(http.HandlerFunc(renderHandler.ServeCatalog)))
 
-	// Delete endpoint — DELETE removes a tile from MinIO, PostgreSQL, and Redis.
+	// Delete endpoint — DELETE removes a tile from S3, PostgreSQL, and Redis.
 	mux.Handle("/api/tiles", auth(http.HandlerFunc(renderHandler.ServeDelete)))
 
 	// Multi-index job API — POST /api/jobs, GET /api/jobs/{id}, …/results.

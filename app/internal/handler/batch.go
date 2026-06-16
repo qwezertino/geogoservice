@@ -16,10 +16,10 @@ const maxBatchSize = 100
 
 // BatchRequest describes a single tile within a batch request.
 type BatchRequest struct {
-	// MinioKey, when provided, bypasses all rendering and cache lookups: the PNG
-	// is fetched directly from MinIO/Redis. Use this when you already have a key
+	// S3Key, when provided, bypasses all rendering and cache lookups: the PNG
+	// is fetched directly from S3/Redis. Use this when you already have a key
 	// from GET /api/catalog — no STAC call will be made.
-	MinioKey string `json:"minio_key,omitempty"`
+	S3Key string `json:"s3_key,omitempty"`
 
 	BBox  [4]float64 `json:"bbox"`  // [minX, minY, maxX, maxY] EPSG:3857
 	Date  string     `json:"date"`  // YYYY-MM-DD
@@ -104,11 +104,11 @@ func (rh *RenderHandler) ServeBatch(w http.ResponseWriter, r *http.Request) {
 // It participates in the shared semaphore so batch renders don't starve
 // single-tile requests and vice-versa.
 func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req BatchRequest) BatchResult {
-	// ── 0. Direct MinIO fetch (catalog flow) ─────────────────────────────────
-	// When minio_key is provided we skip rendering entirely: the tile is already
+	// ── 0. Direct S3 fetch (catalog flow) ─────────────────────────────────
+	// When s3_key is provided we skip rendering entirely: the tile is already
 	// cached and no STAC call will be made.
-	if req.MinioKey != "" {
-		pngBytes, err := rh.store.GetObject(ctx, req.MinioKey)
+	if req.S3Key != "" {
+		pngBytes, err := rh.store.GetObject(ctx, req.S3Key)
 		if err != nil {
 			return BatchResult{Index: idx, Error: "fetch failed: " + err.Error()}
 		}
@@ -165,11 +165,11 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	// ── 1. Cache check ────────────────────────────────────────────────────────
 	hit, found, err := rh.store.Lookup(ctx, bbox, req.Date, req.Index, req.W, req.H, polygonHash, paletteHash)
 	if err == nil && found {
-		pngBytes, err := rh.store.GetObject(ctx, hit.MinioKey)
+		pngBytes, err := rh.store.GetObject(ctx, hit.S3Key)
 		if err == nil {
 			return BatchResult{Index: idx, Data: base64.StdEncoding.EncodeToString(pngBytes), Cached: true}
 		}
-		fmt.Printf("[batch] minio get failed for idx %d, re-rendering: %v\n", idx, err)
+		fmt.Printf("[batch] s3 get failed for idx %d, re-rendering: %v\n", idx, err)
 	}
 
 	// ── 2. Acquire render slot ────────────────────────────────────────────────
