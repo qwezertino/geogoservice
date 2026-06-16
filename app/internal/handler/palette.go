@@ -37,10 +37,9 @@ func tokenPrefixFor(key *cache.APIKey) string {
 }
 
 // paletteForIndex returns the palette stops and cache hash for the given index
-// from the API key's settings. Returns an error when no custom palette is
-// configured for the index — the caller must reject the request rather than
-// silently fall back to render.DefaultPalette, which renders values below its
-// built-in threshold as fully transparent and can look like a broken render.
+// from the API key's settings. Falls back to render.DefaultPalette(index) with
+// hash "" when no custom palette is configured — not every index (e.g. "tci")
+// needs one, and a missing palette must not block the order.
 func paletteForIndex(key *cache.APIKey, index string) ([]render.PaletteStop, string, error) {
 	if key != nil && len(key.Settings) > 0 {
 		var settings struct {
@@ -52,5 +51,5 @@ func paletteForIndex(key *cache.APIKey, index string) ([]render.PaletteStop, str
 			}
 		}
 	}
-	return nil, "", fmt.Errorf("no palette configured for index %q on this API key; set one via PUT /api/me/settings", index)
+	return render.DefaultPalette(index), "", nil
 }
