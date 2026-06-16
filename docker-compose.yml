@@ -79,7 +79,7 @@ services:
       "
     restart: "on-failure"
     networks:
-      - shared-net
+      - ndvi-go-net
 
   # ── Redis (shared L2 tile cache) ─────────────────────────────────────────
   redis:
@@ -111,7 +111,7 @@ services:
       logging.service: "gogeoapp"
     networks:
       - default
-      - shared-net
+      - ndvi-go-net
   # ── Nginx load balancer ─────────────────────────────────────────────────────
   nginx:
     image: nginx:1.25-alpine
@@ -124,7 +124,7 @@ services:
       - gogeoapp
 
 networks:
-  shared-net:
+  ndvi-go-net:
     external: true
 
 # Data is persisted in ./data/ — stop/start containers freely without data loss.
