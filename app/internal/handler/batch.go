@@ -135,6 +135,9 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	if len(req.Polygon) > maxPolygonVertices {
 		return BatchResult{Index: idx, Error: fmt.Sprintf("polygon exceeds limit of %d vertices", maxPolygonVertices)}
 	}
+	if err := validatePolygonPoints(req.Polygon); err != nil {
+		return BatchResult{Index: idx, Error: "invalid polygon: " + err.Error()}
+	}
 
 	bbox := geo.BBox{
 		MinX: req.BBox[0],

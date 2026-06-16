@@ -118,6 +118,10 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, fmt.Sprintf("polygon exceeds limit of %d vertices", maxPolygonVertices), http.StatusBadRequest)
 		return
 	}
+	if err := validatePolygonPoints(req.Polygon); err != nil {
+		http.Error(w, "invalid polygon: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	bbox := geo.BBox{MinX: req.BBox[0], MinY: req.BBox[1], MaxX: req.BBox[2], MaxY: req.BBox[3]}
 	polygon := make([]geo.LngLat, 0, len(req.Polygon))
