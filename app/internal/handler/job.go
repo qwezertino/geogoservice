@@ -136,7 +136,11 @@ func (rh *RenderHandler) ServeCreateJob(w http.ResponseWriter, r *http.Request) 
 	apiKey := APIKeyFromContext(r.Context())
 	tokenPrefix := tokenPrefixFor(apiKey)
 	for _, ix := range indexes {
-		stops, h := paletteForIndex(apiKey, ix)
+		stops, h, err := paletteForIndex(apiKey, ix)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		jobPalettes[ix] = stops
 		if ix == firstIndex {
 			paletteHash = h

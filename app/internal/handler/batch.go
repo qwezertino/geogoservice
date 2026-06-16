@@ -153,7 +153,10 @@ func (rh *RenderHandler) processBatchItem(ctx context.Context, idx int, req Batc
 	}
 	polygonHash := geo.PolygonHash(polygon)
 	apiKey := APIKeyFromContext(ctx)
-	palette, paletteHash := paletteForIndex(apiKey, req.Index)
+	palette, paletteHash, err := paletteForIndex(apiKey, req.Index)
+	if err != nil {
+		return BatchResult{Index: idx, Error: err.Error()}
+	}
 	tokenPrefix := tokenPrefixFor(apiKey)
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────

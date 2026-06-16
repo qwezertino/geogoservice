@@ -107,7 +107,11 @@ func (rh *RenderHandler) handleSync(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	apiKey := APIKeyFromContext(ctx)
 	polygonHash := geo.PolygonHash(params.polygon)
-	palette, paletteHash := paletteForIndex(apiKey, params.index)
+	palette, paletteHash, err := paletteForIndex(apiKey, params.index)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
 	tokenPrefix := tokenPrefixFor(apiKey)
 
 	// ── 1. Cache check ────────────────────────────────────────────────────────
