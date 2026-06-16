@@ -63,7 +63,7 @@ services:
   # ── MinIO bucket initializer (runs once, connects to external minio) ─────────
   # MinIO itself lives in the separate minio-infra project.
   minio-init:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z-cpuv1
     environment:
       MINIO_ENDPOINT: ${MINIO_ENDPOINT}
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
