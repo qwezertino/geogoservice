@@ -5,8 +5,8 @@ info:
   version: "1.0.0"
   description: |
     Satellite imagery rendering service for spectral indexes (NDVI, EVI, GNDVI, CVI, TCI, Soil Moisture)
-    based on Sentinel-2 scenes. Tiles are rendered on demand, cached in MinIO + PostgreSQL,
-    and optionally colorised with per-token custom palettes.
+    based on Sentinel-2 scenes. Tiles are rendered on demand, cached in S3 (SeaweedFS or any
+    S3-compatible store) + PostgreSQL, and optionally colorised with per-token custom palettes.
 
     ## Authentication
 
@@ -154,11 +154,11 @@ components:
       type: object
       required: [bbox, date, index, w, h]
       properties:
-        minio_key:
+        s3_key:
           type: string
           description: |
             When provided, bypasses all rendering and STAC calls — the PNG is fetched
-            directly from MinIO. Use the key returned by GET /api/catalog.
+            directly from S3/Redis. Use the key returned by GET /api/catalog.
           example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
         bbox:
           type: array
@@ -308,11 +308,11 @@ components:
         date:
           type: string
           format: date
-        index_type:
+        index:
           $ref: "#/components/schemas/SpectralIndex"
-        minio_key:
+        s3_key:
           type: string
-          description: Pass to GET /api/images or POST /api/render/batch (minio_key field)
+          description: Pass to GET /api/images or POST /api/render/batch (s3_key field)
           example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256_5ba19d23.png"
         cloud_cover:
           type: number
@@ -331,28 +331,40 @@ components:
             histogram:
               type: array
               items: { type: integer }
+        bbox:
+          type: array
+          items: { type: number }
+          minItems: 4
+          maxItems: 4
+          description: "[minX, minY, maxX, maxY] in EPSG:3857"
 
     # ── Catalog ───────────────────────────────────────────────────────────────
 
     CatalogTile:
       type: object
       properties:
-        minio_key:
+        s3_key:
           type: string
           example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
         date_acquired:
           type: string
           format: date
-        index_type:
-          $ref: "#/components/schemas/SpectralIndex"
         width:
           type: integer
         height:
           type: integer
-        bbox_3857:
-          type: array
-          items: { type: number }
-          description: "[minX, minY, maxX, maxY] in EPSG:3857"
+        bbox_minx:
+          type: number
+          description: "EPSG:3857 west boundary"
+        bbox_miny:
+          type: number
+          description: "EPSG:3857 south boundary"
+        bbox_maxx:
+          type: number
+          description: "EPSG:3857 east boundary"
+        bbox_maxy:
+          type: number
+          description: "EPSG:3857 north boundary"
 
     # ── Scenes ────────────────────────────────────────────────────────────────
 
@@ -481,8 +493,8 @@ paths:
         same order as the input — the client can set all `<img src>` attributes at once
         so all tiles appear simultaneously.
 
-        When `minio_key` is provided on an item, rendering and STAC search are bypassed —
-        the PNG is fetched directly from MinIO. Use keys returned by GET /api/catalog
+        When `s3_key` is provided on an item, rendering and STAC search are bypassed —
+        the PNG is fetched directly from S3/Redis. Use keys returned by GET /api/catalog
         or GET /api/jobs/{id}/results for this fast path.
       requestBody:
         required: true
@@ -529,12 +541,12 @@ paths:
 
         **Self-healing**: if the `.ndvi.bin` companion was not saved when the tile was
         originally rendered, the server transparently re-fetches bands from STAC,
-        recomputes the index, persists the raw file to MinIO, and returns the data.
+        recomputes the index, persists the raw file to S3, and returns the data.
       parameters:
         - name: key
           in: query
           required: true
-          description: MinIO object key of the PNG tile (from GET /api/catalog or job results)
+          description: S3 object key of the PNG tile (from GET /api/catalog or job results)
           schema:
             type: string
           example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
@@ -565,17 +577,17 @@ paths:
   /api/images:
     get:
       tags: [Render]
-      summary: Proxy PNG from MinIO by key
+      summary: Proxy PNG from S3 by key
       description: |
-        Streams the PNG stored in MinIO for the given key. Used as a proxy so the
-        frontend can display job-rendered tiles without direct MinIO access.
+        Streams the PNG stored in S3 for the given key. Used as a proxy so the
+        frontend can display job-rendered tiles without direct S3 access.
         The `Cache-Control` header is set to `immutable` — the key encodes all render
         parameters so the content never changes.
       parameters:
         - name: key
           in: query
           required: true
-          description: MinIO object key (from GET /api/catalog or GET /api/jobs/{id}/results)
+          description: S3 object key (from GET /api/catalog or GET /api/jobs/{id}/results)
           schema:
             type: string
           example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"
@@ -597,7 +609,7 @@ paths:
         "401":
           description: Missing or invalid API key
         "404":
-          description: Object not found in MinIO
+          description: Object not found in S3
 
   # ── Jobs ────────────────────────────────────────────────────────────────────
 
@@ -609,7 +621,7 @@ paths:
         Enqueues a background job that renders every (scene, index) combination found
         in the given date range and bounding box. The server discovers Sentinel-2 scenes
         via STAC, performs an AOI cloud-fraction check on each scene, and renders +
-        saves all tiles to MinIO + PostgreSQL with per-tile statistics.
+        saves all tiles to S3 + PostgreSQL with per-tile statistics.
 
         Already-cached tiles are skipped. The palette stored in the API key's settings
         at the moment of job creation is captured and applied to all tiles — it won't
@@ -683,7 +695,7 @@ paths:
       description: |
         Returns all tiles produced by the job, sorted by date then index name.
         Only available once the job status is `done`. Tiles from all requested
-        indexes are included. The `minio_key` field can be passed directly to
+        indexes are included. The `s3_key` field can be passed directly to
         GET /api/images or POST /api/render/batch.
       parameters:
         - name: id
@@ -718,7 +730,7 @@ paths:
         intersects the given WGS-84 `bbox`. Always returns `[]` (not `null`) when
         there are no results.
 
-        The `minio_key` from each result can be used with GET /api/images,
+        The `s3_key` from each result can be used with GET /api/images,
         GET /api/ndvi-raw, or POST /api/render/batch.
       parameters:
         - name: year
@@ -754,14 +766,14 @@ paths:
       tags: [Catalog]
       summary: Delete a cached tile
       description: |
-        Removes the tile identified by its MinIO object key from all three stores:
-        MinIO, PostgreSQL, and Redis (if enabled). The key is returned by GET /api/catalog
-        in the `minio_key` field.
+        Removes the tile identified by its S3 object key from all three stores:
+        S3, PostgreSQL, and Redis (if enabled). The key is returned by GET /api/catalog
+        in the `s3_key` field.
       parameters:
         - name: key
           in: query
           required: true
-          description: MinIO object key of the tile to delete
+          description: S3 object key of the tile to delete
           schema:
             type: string
           example: "ndvi/2026-05-08/3674576.37_6259695.78_3677117.90_6262313.74_256x256.png"

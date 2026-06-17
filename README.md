@@ -99,196 +99,9 @@ curl http://localhost/health
 
 ## API
 
-### `GET /api/render`
+Полная интерактивная документация — **Swagger UI: `http://localhost/swagger/`**
 
-Generates an NDVI PNG tile for the given bounding box and date. Returns the cached tile immediately on subsequent requests.
-
-An optional polygon mask clips the PNG to an arbitrary shape — pixels outside the polygon become transparent. Masked and unmasked versions are cached independently.
-
-#### Parameters
-
-Both the modern and the legacy GeoServer format are accepted simultaneously.
-
-| Parameter | Format | Description |
-|-----------|--------|-------------|
-| `bbox` | `minX,minY,maxX,maxY` | Bounding box in **EPSG:3857** (metres). Legacy: `box[0..3]=` |
-| `date` | `YYYY-MM-DD` or Unix timestamp | Acquisition date |
-| `w` / `width` | integer 1–2048 | Output width in pixels |
-| `h` / `height` | integer 1–2048 | Output height in pixels |
-| `index` / `indexName` | `ndvi` | Spectral index |
-| `polygon` | `lng1,lat1,lng2,lat2,...` | Optional WGS-84 clipping polygon (≥ 3 pairs). Pixels outside become transparent |
-| `window` | integer | Search window ±N days around `date` (overrides `STAC_SEARCH_WINDOW_DAYS`) |
-| `cloud` | float 0–100 | Max cloud cover % (overrides `STAC_MAX_CLOUD_COVER`) |
-| `srs` | `EPSG:3857` | CRS (optional, only EPSG:3857 accepted) |
-
-#### Response
-
-- `200 OK` — PNG image (`image/png`)
-- `400 Bad Request` — invalid or missing parameters
-- `404 Not Found` — no Sentinel-2 scene found for the given bbox/date
-- `500 Internal Server Error` — GDAL or processing error
-
-#### Example — with polygon mask
-
-```bash
-curl "http://localhost/api/render?bbox=3430000,5872000,3432000,5874000&date=2026-04-01&w=512&h=512\
-&polygon=30.83,46.21,30.84,46.21,30.84,46.22,30.83,46.22" \
-  --output masked_ndvi.png
-```
-
----
-
-### `POST /api/render/batch`
-
-Renders multiple tiles in parallel and returns all results at once. Intended for NDVI viewers that need to load 10–20 tiles simultaneously — all tiles appear at the same time.
-
-**When `s3_key` is provided the tile is fetched directly from cache (S3/Redis) — no STAC call is made.** Use this for the catalog-viewer flow.
-
-**Concurrent GDAL renders are capped at `RENDER_WORKERS` (default: `NumCPU`).**
-**Maximum batch size: 100 tiles.**
-
-#### Request body
-
-JSON array of tile descriptors. Two usage modes:
-
-**Mode 1 — fetch from cache by key** (catalog flow, no STAC):
-
-```json
-[
-  {"s3_key": "ndvi/2026-04-01/3430440_..._512x398.png"},
-  {"s3_key": "ndvi/2026-04-02/3430440_..._512x398.png"}
-]
-```
-
-**Mode 2 — render on demand** (arbitrary bbox/date):
-
-```json
-[
-  {"bbox": [minX, minY, maxX, maxY], "date": "2024-06-15", "index": "ndvi", "w": 512, "h": 512},
-  {"bbox": [minX, minY, maxX, maxY], "date": "2024-07-01", "index": "ndvi", "w": 512, "h": 512,
-   "polygon": [[30.83, 46.21], [30.84, 46.21], [30.84, 46.22]],
-   "search_window_days": 3, "max_cloud_cover": 5}
-]
-```
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `s3_key` | `string` | — | Object key from `GET /api/catalog`. If present, all other fields are ignored |
-| `bbox` | `[4]float64` | yes* | `[minX, minY, maxX, maxY]` in EPSG:3857. *Required when `s3_key` is absent |
-| `date` | `string` | yes* | `YYYY-MM-DD` |
-| `index` | `string` | yes* | `"ndvi"` |
-| `w` | `int` | yes* | Width in pixels (1–2048) |
-| `h` | `int` | yes* | Height in pixels (1–2048) |
-| `polygon` | `[[lng,lat],...]` | no | WGS-84 clipping polygon (≥ 3 pairs) |
-| `search_window_days` | `int` | no | Override `STAC_SEARCH_WINDOW_DAYS` |
-| `max_cloud_cover` | `float64` | no | Override `STAC_MAX_CLOUD_COVER` |
-
-#### Response body
-
-JSON array in the **same order** as the request:
-
-```json
-[
-  {"index": 0, "data": "<base64 PNG>", "cached": true},
-  {"index": 1, "error": "no scene found"}
-]
-```
-
-- `200 OK` — always returned; per-tile errors are embedded in the array
-- `400 Bad Request` — malformed JSON or batch exceeds 100 items
-
----
-
-### `GET /api/catalog`
-
-Returns cached NDVI tiles from PostgreSQL that intersect a given WGS-84 bounding box and were acquired in a given year.
-
-#### Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `year` | Integer, 2015–2100 |
-| `bbox` | `minLng,minLat,maxLng,maxLat` in **EPSG:4326** (WGS-84 degrees) |
-
-#### Response body
-
-JSON array (never `null` — empty array when no results):
-
-```json
-[
-  {
-    "s3_key":     "ndvi/2026-04-01/3430440_5873412_..._512x398.png",
-    "date_acquired": "2026-04-01",
-    "index_type":    "ndvi",
-    "width":         512,
-    "height":        398,
-    "bbox_minx":     3430440.234,
-    "bbox_miny":     5873412.602,
-    "bbox_maxx":     3430578.179,
-    "bbox_maxy":     5873519.801
-  }
-]
-```
-
-Pass the `s3_key` values straight into `POST /api/render/batch` to load tiles without any STAC calls.
-
-- `200 OK` — JSON array
-- `400 Bad Request` — invalid year or bbox
-- `500 Internal Server Error` — database error
-
-#### Example
-
-```bash
-curl "http://localhost/api/catalog?year=2026&bbox=30.8,46.2,31.2,46.6"
-```
-
----
-
-### `DELETE /api/tiles`
-
-Removes a single tile from S3, PostgreSQL, and Redis.
-
-#### Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `key` | `s3_key` value from `GET /api/catalog` |
-
-#### Response
-
-- `200 OK` — `{"deleted": "<key>"}`
-- `400 Bad Request` — missing or invalid key (path traversal rejected)
-- `500 Internal Server Error` — storage error
-
-#### Example
-
-```bash
-curl -X DELETE "http://localhost/api/tiles?key=ndvi/2026-04-01/3430440_..._512x398.png"
-```
-
----
-
-## Typical catalog-viewer flow
-
-```
-1. GET /api/catalog?year=2026&bbox=<viewport WGS-84>
-      → returns list of tiles with s3_key
-
-2. POST /api/render/batch
-      body: [{"s3_key": "..."}, {"s3_key": "..."}, ...]
-      → returns base64 PNGs for all tiles at once, fetched from cache only
-        (no STAC calls, no rendering)
-
-3. Display all tiles simultaneously
-```
-
-## Colour map
-
-| NDVI value | Colour | Meaning |
-|------------|--------|---------|
-| −1.0 … 0.05 | Transparent | Water, clouds, bare rock |
-| 0.05 … 0.2  | Red → Yellow | Sparse / stressed vegetation |
-| 0.2 … 1.0   | Light green → Dark green | Healthy vegetation |
+Спецификация в формате OpenAPI 3.0: `http://localhost/openapi.yaml`
 
 ---
 
@@ -310,23 +123,28 @@ Set `STAC_PROVIDER` in `.env` to change the preferred provider. Fallback is auto
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | HTTP listen port inside the container |
+| `ADMIN_TOKEN` | — | Secret for `X-Admin-Token` header (admin endpoints disabled if empty) |
 | `DB_HOST` | — | PostGIS hostname |
 | `DB_PORT` | — | PostGIS port |
 | `DB_USER` | — | PostGIS user |
 | `DB_PASSWORD` | — | PostGIS password |
 | `DB_NAME` | — | PostGIS database name |
-| `S3_ENDPOINT` | — | S3 host:port |
+| `S3_ENDPOINT` | — | S3 gateway host:port (no `http://` prefix) |
 | `S3_ACCESS_KEY` | — | S3 access key |
 | `S3_SECRET_KEY` | — | S3 secret key |
 | `S3_BUCKET` | — | S3 bucket name |
-| `S3_USE_SSL` | `false` | Use TLS for S3 |
+| `S3_USE_SSL` | `false` | Use TLS for S3 connections |
 | `REDIS_URL` | — | Redis connection URL (`redis://host:port/db`). Redis is disabled if empty |
 | `STAC_PROVIDER` | `planetary-computer` | Preferred STAC provider |
 | `STAC_SEARCH_WINDOW_DAYS` | `15` | ±N day search radius around the requested date |
-| `STAC_MAX_CLOUD_COVER` | `20` | Max cloud cover % for scene selection |
+| `MAX_AOI_CLOUD_COVER` | `80` | AOI cloud % above which a scene is rendered without temporal fill |
 | `RENDER_WORKERS` | `NumCPU` | Max parallel GDAL renders |
+| `MAX_RENDER_ATTEMPTS` | `3` | Render retries per scene/index before marking as failed |
 | `HOST_PORT_HTTP` | `80` | Host port for Nginx |
 | `HOST_PORT_DB` | `5432` | Host port for PostgreSQL |
+| `CDSE_S3_ACCESS_KEY` | — | Copernicus Data Space S3 credentials (long-lived, from eodata-s3keysmanager) |
+| `CDSE_S3_SECRET_KEY` | — | Copernicus Data Space S3 secret |
+| `PPROF_ENABLED` | `false` | Expose pprof profiler at `:6060` |
 
 ---
 
